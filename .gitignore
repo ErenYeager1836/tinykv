@@ -1,0 +1,20 @@
+# Build outputs
+build*/
+bin/
+*.o
+*.a
+*.so
+
+# Executables
+tinykv
+test_*
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Profiling / Benchmark outputs
+perf.data*
+bench/results.md.tmp

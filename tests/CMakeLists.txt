@@ -1,0 +1,7 @@
+add_executable(test_echo test_echo.cpp)
+target_compile_options(test_echo PRIVATE ${TINYKV_COMMON_FLAGS})
+if(TINYKV_LINK_FLAGS)
+    target_link_options(test_echo PRIVATE ${TINYKV_LINK_FLAGS})
+endif()
+
+add_test(NAME test_echo COMMAND test_echo $<TARGET_FILE:tinykv>)
