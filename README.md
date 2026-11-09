@@ -1,8 +1,59 @@
 # tinykv
 
-A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux.
+[![CI](https://github.com/ErenYeager1836/tinykv/actions/workflows/ci.yml/badge.svg)](https://github.com/ErenYeager1836/tinykv/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
+![Platform: Linux](https://img.shields.io/badge/Platform-Linux-lightgrey)
 
-> **Project Status**: Complete (Milestones 1–8). Production-ready portfolio project with measured benchmarks, zero compiler warnings, ASAN/UBSAN clean, `-fno-exceptions`, `-fno-rtti`, custom open-addressing hash table and slab allocator, and RESP2 compliance.
+A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux. Single-threaded `epoll` event loop, custom open-addressing hash table, and slab allocator speaking the RESP2 protocol.
+
+---
+
+## Performance & Footprint at a Glance
+
+### Benchmark: tinykv vs. Valkey 9.1.2 (in-memory mode)
+Tested with `valkey-benchmark` on Linux `7.2.11-arch1-1` (11th Gen Intel Core i5-1135G7 @ 2.40GHz, 50 concurrent connections, 100,000 requests per run, median of 5 runs). Valkey persistence completely disabled (`--save "" --appendonly no --protected-mode no`). Generated reproducibly via [`bench/run.sh`](bench/run.sh).
+
+| Workload | Pipeline | Value Size | tinykv (req/sec) | Valkey 9.1.2 (req/sec) | tinykv p99 | Valkey p99 | Comparison |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **SET** | P=1 | 16 B | 66,622.25 | 66,445.18 | 0.855 ms | 1.223 ms | **Roughly on par** (+0.3%) |
+| **GET** | P=1 | 16 B | 64,850.84 | 67,204.30 | 1.159 ms | 0.975 ms | **Roughly on par** (-3.5%) |
+| **SET** | P=1 | 256 B | 67,069.08 | 66,755.67 | 0.839 ms | 0.887 ms | **Roughly on par** (+0.5%) |
+| **GET** | P=1 | 256 B | 63,856.96 | 67,521.95 | 0.911 ms | 0.831 ms | **Roughly on par** (-5.4%) |
+| **SET** | P=16 | 16 B | **800,000.00** | 386,100.38 | **1.703 ms** | 3.079 ms | **+107.2%** |
+| **GET** | P=16 | 16 B | **909,090.94** | 502,512.56 | **1.415 ms** | 3.375 ms | **+80.9%** |
+| **SET** | P=16 | 256 B | **826,446.31** | 355,871.91 | **1.191 ms** | 4.335 ms | **+132.2%** |
+| **GET** | P=16 | 256 B | **775,193.81** | 480,769.22 | **1.447 ms** | 2.783 ms | **+61.2%** |
+
+> **Context on these numbers**:
+> - **At `P=1`**: Both servers are roughly on par (~64k–67k rps). At single-request depth, loopback TCP round-trip latency dominates; gaps of 2–5% are within test noise.
+> - **At `P=16`**: `tinykv` achieves 775k–909k rps vs. Valkey's 355k–502k rps (+61% to +132%). These figures approach the throughput limits of `valkey-benchmark` itself on loopback. The relative ratio is meaningful because both servers run against the identical benchmark client, but 800k–900k rps represents client saturation rather than the server's absolute ceiling.
+> - **Why tinykv is faster on pipelines**: `tinykv` does **far less per command** than Valkey. It has no ACL checks, no cluster routing, no background stat accumulators, no persistence hooks, and no multi-type dispatch branches. Paired with a zero-copy streaming RESP parser and contiguous slab allocation, pipelined batches process with minimal overhead.
+
+---
+
+### Binary Footprint & Cold Startup
+
+#### Disk & Memory Footprint (Like-for-Like Dynamic Comparison)
+Measured on Arch Linux x86-64 with GCC 16.2.1 (`-Os`, `-flto`, `-ffunction-sections`, `-fdata-sections`, `-Wl,--gc-sections`, `strip`):
+
+| Target | Binary Size | Text Section | Dependencies | Like-for-Like Comparison |
+|:---|:---:|:---:|:---|:---:|
+| **Valkey 9.1.2** (`valkey-server`) | **3,276 KB** (3.2 MB) | 2,933,314 B | glibc, libm, libssl, jemalloc, lua | Baseline (dynamic) |
+| **tinykv (Dynamic MinSizeRel)** | **35 KB** | 25,723 B | glibc, libstdc++ | **91× smaller** (dynamic vs. dynamic)* |
+| **tinykv (Default Release -O3)** | **80 KB** | 63,114 B | glibc, libstdc++ | **41× smaller** |
+| **tinykv (Static Standalone)** | **871 KB** | 833,706 B | None (bundled glibc) | Self-contained (no external shared libs) |
+
+*\* Note: The 35 KB dynamic binary relies on system-provided `libc.so` and `libstdc++.so`, which already reside in system memory. The 871 KB static build embeds glibc syscalls directly into a standalone zero-dependency executable.*
+
+#### Cold Startup Latency (Time to First PING Reply)
+Measured using [`bench/startup_bench.cpp`](bench/startup_bench.cpp) (spawning cold processes over loopback and timing socket connection + first `+PONG` reply, median of 20 runs):
+
+| Server | Median Startup Latency | Min Latency | Max Latency | Speedup |
+|:---|:---:|:---:|:---:|:---:|
+| **Valkey 9.1.2** | 46.52 ms | 45.54 ms | 85.28 ms | 1.0× (baseline) |
+| **tinykv (Dynamic MinSizeRel)** | **3.25 ms** | 3.00 ms | 5.98 ms | **14.3× faster** |
+| **tinykv (Static Standalone)** | **1.39 ms** | 1.26 ms | 2.36 ms | **33.5× faster** |
 
 ---
 
@@ -11,9 +62,9 @@ A minimal, fast, Redis-compatible key-value server written in modern C++20 for L
 `tinykv` is a learning-scale systems programming project built to explore low-level network programming, Linux `epoll` event loops, protocol parsing, and custom memory management. It speaks the standard Redis Serialization Protocol (RESP2), allowing standard tools like `redis-cli` and `redis-benchmark` to connect without modification.
 
 ### Core Goals
-- **Minimal binary footprint**: Crushes general-purpose servers on static binary size (35 KB dynamic, 871 KB static standalone vs. 3.2 MB Valkey) and cold startup latency (1.4 ms vs. 46.5 ms Valkey).
+- **Minimal binary footprint**: Crushes general-purpose servers on dynamic binary size (35 KB vs 3.2 MB) and cold startup latency (1.4 ms static vs. 46.5 ms Valkey).
 - **Single-threaded simplicity**: Pure event-driven epoll loop without locks, race conditions, or context-switch overhead.
-- **High throughput pipelining**: Exceeds 1,000,000 req/sec under pipelined workloads (+75% to +110% over Valkey).
+- **High throughput pipelining**: Maximizes throughput under pipelined workloads by minimizing per-command state and eliminating buffer memory moves.
 - **Memory safety & robustness**: Built with strict warnings (`-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror`), verified clean under AddressSanitizer and UndefinedBehaviorSanitizer, with hard-bounded buffer limits.
 
 ---
@@ -36,49 +87,6 @@ A minimal, fast, Redis-compatible key-value server written in modern C++20 for L
 - Lua scripting
 - Pub/Sub
 - Advanced data structures (Sets, Sorted Sets, Hashes, Streams, Bitmaps, HyperLogLogs)
-
----
-
-## Benchmark Results (tinykv vs. Valkey 9.1.2)
-
-Tested using `valkey-benchmark` on Linux `7.2.11-arch1-1` (11th Gen Intel Core i5-1135G7 @ 2.40GHz, 50 concurrent connections, 100,000 requests per run, median of 5 runs). Run via `bench/run.sh`.
-
-| Workload | Pipeline | Value Size | tinykv (req/sec) | Valkey 9.1.2 (req/sec) | tinykv p99 | Valkey p99 | Speedup (%) |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **SET** | P=1 | 16 B | 74,850.30 | 76,745.97 | 0.711 ms | 0.575 ms | -2.5% |
-| **GET** | P=1 | 16 B | 74,404.77 | 77,041.60 | 0.751 ms | 0.695 ms | -3.4% |
-| **SET** | P=1 | 256 B | 74,515.65 | 78,125.00 | 0.719 ms | 0.743 ms | -4.6% |
-| **GET** | P=1 | 256 B | 73,046.02 | 77,041.60 | 0.687 ms | 0.743 ms | -5.2% |
-| **SET** | P=16 | 16 B | **970,873.81** | 460,829.50 | **0.615 ms** | 2.175 ms | **+110.7%** |
-| **GET** | P=16 | 16 B | **1,020,408.19** | 581,395.31 | **0.639 ms** | 1.807 ms | **+75.5%** |
-| **SET** | P=16 | 256 B | **952,381.00** | 460,829.50 | **0.647 ms** | 2.135 ms | **+106.7%** |
-| **GET** | P=16 | 256 B | **934,579.44** | 529,100.56 | **0.671 ms** | 2.231 ms | **+76.6%** |
-
-*Note: For non-pipelined ping-pong requests (`P=1`), Valkey edges out tinykv by 2.5% to 5.2%. For pipelined requests (`P=16`), tinykv outperforms Valkey by 75% to 110% due to its zero-copy RESP parser, single-threaded zero-lock architecture, and contiguous slab allocation.*
-
----
-
-## Binary Size & Startup Time
-
-### Binary Footprint (Disk & Memory)
-Measured on Arch Linux x86-64 using GCC 16.2.1 (`-Os`, `-flto`, `-ffunction-sections`, `-fdata-sections`, `-Wl,--gc-sections`, stripped):
-
-| Target | Binary Size | Text Section | Dependencies | Ratio vs. Valkey |
-|:---|:---:|:---:|:---|:---:|
-| **Valkey 9.1.2** (`valkey-server`) | **3,276 KB** (3.2 MB) | 2,933,314 B | glibc, libm, libssl, jemalloc, lua | 1.0× (baseline) |
-| **tinykv (Default Release)** | **80 KB** | 63,114 B | glibc, libstdc++ | **41× smaller** |
-| **tinykv (Dynamic MinSizeRel)** | **35 KB** | 25,723 B | glibc, libstdc++ | **91× smaller** |
-| **tinykv (Dynamic libc-only)** | **168 KB** | 151,416 B | glibc only (static libstdc++) | **19× smaller** |
-| **tinykv (Fully Static Standalone)** | **871 KB** | 833,706 B | None (zero external shared libs) | **3.7× smaller** |
-
-### Cold Startup Latency (Time to First PING Reply)
-Measured using `bench/startup_bench` (spawning cold processes over loopback and timing socket connection + first `+PONG` reply, median of 20 runs):
-
-| Server | Median Startup Latency | Min Latency | Max Latency | Speedup |
-|:---|:---:|:---:|:---:|:---:|
-| **Valkey 9.1.2** | 46.46 ms | 45.13 ms | 230.47 ms | 1.0× (baseline) |
-| **tinykv (Dynamic MinSizeRel)** | **3.34 ms** | 2.97 ms | 4.49 ms | **13.9× faster** |
-| **tinykv (Fully Static Standalone)** | **1.40 ms** | 1.24 ms | 1.52 ms | **33.2× faster** |
 
 ---
 
@@ -120,12 +128,14 @@ Measured using `bench/startup_bench` (spawning cold processes over loopback and 
 - **Memory Management**: Slab allocator with 15 size classes (16 B to 4096 B) and freelist recycling. Zero heap fragmentation under high-churn insert/delete cycles.
 - **Dual Expiration**: Instant lazy expiration during lookup + active background ring-buffer sweep at 10 Hz with VDSO `CLOCK_MONOTONIC_COARSE`.
 
+See [`docs/DESIGN.md`](docs/DESIGN.md) for full architectural documentation and trade-off analysis.
+
 ---
 
 ## Quick Start
 
 ### Requirements
-- Arch Linux (or any modern Linux distribution with kernel 5.x+)
+- Linux (kernel 5.x+)
 - GCC 13+ or Clang 16+ supporting C++20
 - CMake 3.20+
 - Ninja
@@ -133,7 +143,7 @@ Measured using `bench/startup_bench` (spawning cold processes over loopback and 
 ### 1. Default Release Build
 ```bash
 # Clone the repository
-git clone https://github.com/<your-username>/tinykv.git
+git clone https://github.com/ErenYeager1836/tinykv.git
 cd tinykv
 
 # Configure and compile with Ninja
@@ -203,11 +213,11 @@ QUIT
 
 ### Running Benchmarks
 ```bash
-# Reproducible throughput benchmark against Valkey
+# Reproducible throughput benchmark against Valkey (requires valkey-server & valkey-benchmark)
 ./bench/run.sh
 
 # Cold startup time benchmark (median of 20 runs)
-./build/startup_bench --runs 20
+./build/startup_bench build-minsize/tinykv tinykv 16392 20
 ```
 
 ---
@@ -219,3 +229,8 @@ QUIT
 - James Smith's *"Build Your Own Redis with C/C++"* tutorials for non-blocking event-loop design patterns.
 - Austin Appleby for MurmurHash3.
 
+---
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

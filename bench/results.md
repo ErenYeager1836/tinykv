@@ -7,17 +7,19 @@
 - **tinykv Version**: `v0.1.0 (Release)`
 - **Comparison Server**: `Valkey server v=9.1.2 sha=7f1dffed:1 malloc=jemalloc-5.3.1 bits=64 build=ab3e536b46916906`
 - **Benchmark Tool**: `valkey-benchmark 9.1.2 (git:7f1dffed-dirty)`
+- **Valkey Server Flags**: `--save "" --appendonly no --protected-mode no` (persistence completely disabled for fair in-memory comparison)
+- **tinykv Server Flags**: `--port 16379 --bind 127.0.0.1` (single-threaded epoll, default slab/arena allocator)
 - **Parameters**: `-n 100000`, `-c 50`, 5 runs per configuration (reporting median)
 
 ## Performance Comparison Table
 
 | Workload | Pipeline | Value Size | tinykv (req/sec) | Valkey (req/sec) | tinykv p99 (ms) | Valkey p99 (ms) | Speedup (%) |
 |:---------|:--------:|:----------:|:----------------:|:-----------------------------:|:---------------:|:----------------------------:|:-----------:|
-| SET | P=1 | 16 B | 74850.30 | 76745.97 | 0.711 ms | 0.575 ms | -2.5% |
-| GET | P=1 | 16 B | 74404.77 | 77041.60 | 0.751 ms | 0.695 ms | -3.4% |
-| SET | P=1 | 256 B | 74515.65 | 78125.00 | 0.719 ms | 0.743 ms | -4.6% |
-| GET | P=1 | 256 B | 73046.02 | 77041.60 | 0.687 ms | 0.743 ms | -5.2% |
-| SET | P=16 | 16 B | 970873.81 | 460829.50 | 0.615 ms | 2.175 ms | +110.7% |
-| GET | P=16 | 16 B | 1020408.19 | 581395.31 | 0.639 ms | 1.807 ms | +75.5% |
-| SET | P=16 | 256 B | 952381.00 | 460829.50 | 0.647 ms | 2.135 ms | +106.7% |
-| GET | P=16 | 256 B | 934579.44 | 529100.56 | 0.671 ms | 2.231 ms | +76.6% |
+| SET | P=1 | 16 B | 66622.25 | 66445.18 | 0.855 ms | 1.223 ms | +0.3% |
+| GET | P=1 | 16 B | 64850.84 | 67204.30 | 1.159 ms | 0.975 ms | -3.5% |
+| SET | P=1 | 256 B | 67069.08 | 66755.67 | 0.839 ms | 0.887 ms | +0.5% |
+| GET | P=1 | 256 B | 63856.96 | 67521.95 | 0.911 ms | 0.831 ms | -5.4% |
+| SET | P=16 | 16 B | 800000.00 | 386100.38 | 1.703 ms | 3.079 ms | +107.2% |
+| GET | P=16 | 16 B | 909090.94 | 502512.56 | 1.415 ms | 3.375 ms | +80.9% |
+| SET | P=16 | 256 B | 826446.31 | 355871.91 | 1.191 ms | 4.335 ms | +132.2% |
+| GET | P=16 | 256 B | 775193.81 | 480769.22 | 1.447 ms | 2.783 ms | +61.2% |

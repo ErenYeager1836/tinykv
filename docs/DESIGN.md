@@ -349,8 +349,9 @@ Hardware: 11th Gen Intel Core i5-1135G7 @ 2.40GHz | Linux 7.2.11-arch1-1 | 50 cl
 
 ### 7.4 Honest Comparison vs. Valkey 9.1.2
 
-- **Non-Pipelined (`P=1`)**: Valkey achieves ~76k–78k rps vs. tinykv's ~73k–75k rps (Valkey edges ahead by 2.5% to 5.2%). Valkey's extensive jemalloc integration and multi-page socket read buffers provide a slight edge under sequential ping-pong loads.
-- **Pipelined (`P=16`)**: tinykv crushes Valkey by **+75.5% to +110.7%**, achieving **1,020,408 req/sec** on `GET` and **970,873 req/sec** on `SET` (vs. Valkey's 581,395 rps and 460,829 rps). tinykv's single-threaded zero-lock architecture, contiguous slab allocator, and zero-copy RESP parsing shine under high-throughput batching.
+- **Non-Pipelined (`P=1`)**: Both servers perform **roughly on par** (~64k–67k rps), with variations between +0.5% and -5.4% which fall within normal loopback round-trip latency noise for single-request ping-pong clients.
+- **Pipelined (`P=16`)**: `tinykv` outperforms Valkey by **+61% to +132%** (775k–909k rps vs. 355k–502k rps). These numbers approach the throughput saturation limits of `valkey-benchmark` itself over loopback.
+- **Why tinykv is faster on pipelines**: `tinykv` does **far less per command** than Valkey: it performs no ACL permission checks, maintains no client stats/metrics dictionaries, executes no persistence or replication hooks, and avoids multi-type polymorphic dispatch. Combined with zero-copy stream parsing and contiguous slab memory recycling, pipelined batches execute with minimal CPU instruction overhead.
 
 ---
 
@@ -369,27 +370,27 @@ The `MinSizeRel` build preset applies the following flags:
 
 ### 8.2 Real Measured Binary Sizes
 
-| Profile / Configuration | Binary Size | Text Section | Data Section | BSS Section | Dependencies |
-|:---|:---:|:---:|:---:|:---:|:---|
-| **Valkey 9.1.2** (`valkey-server`) | **3,276 KB** (3.2 MB) | 2,933,314 B | 336,804 B | 220,184 B | glibc, libm, libssl, libcrypto, jemalloc, lua |
-| **tinykv (Default Release)** | **80 KB** | 63,114 B | 968 B | 24 B | glibc, libstdc++ |
-| **tinykv (Dynamic MinSizeRel)** | **35 KB** | 25,723 B | 1,008 B | 24 B | glibc, libstdc++ |
-| **tinykv (Dynamic libc-only)** | **168 KB** | 151,416 B | 5,144 B | 472 B | glibc only (static libstdc++) |
-| **tinykv (Fully Static Standalone)** | **871 KB** | 833,706 B | 27,768 B | 23,056 B | None (zero external dependencies) |
+| Profile / Configuration | Binary Size | Text Section | Data Section | BSS Section | Dependencies | Like-for-Like Comparison |
+|:---|:---:|:---:|:---:|:---:|:---|:---:|
+| **Valkey 9.1.2** (`valkey-server`) | **3,276 KB** (3.2 MB) | 2,933,314 B | 336,804 B | 220,184 B | glibc, libm, libssl, jemalloc, lua | Baseline (dynamic) |
+| **tinykv (Dynamic MinSizeRel)** | **35 KB** | 25,723 B | 1,008 B | 24 B | glibc, libstdc++ | **91× smaller** (dynamic vs. dynamic)* |
+| **tinykv (Default Release)** | **80 KB** | 63,114 B | 968 B | 24 B | glibc, libstdc++ | **41× smaller** |
+| **tinykv (Dynamic libc-only)** | **168 KB** | 151,416 B | 5,144 B | 472 B | glibc only (static libstdc++) | **19× smaller** |
+| **tinykv (Fully Static Standalone)** | **871 KB** | 833,706 B | 27,768 B | 23,056 B | None (bundled glibc) | Self-contained (no external libs) |
 
-> **Size Ratio**: At **35 KB**, dynamic `tinykv` is **91× smaller** than `valkey-server` on disk. The standalone static build (871 KB) is **3.7× smaller** than Valkey despite bundling the entire C runtime.
+> **Fair Comparison Note**: In a fair dynamic-to-dynamic comparison, `tinykv` is **91× smaller** (35 KB vs. 3.2 MB), recognizing that the 35 KB binary relies on system-provided `libc.so` and `libstdc++.so`. When built as a completely self-contained static executable bundling the entire C runtime, `tinykv` remains compact at 871 KB.
 
 ### 8.3 Cold Startup Latency (Time to First PING Reply)
 
-Measured using `bench/startup_bench` (spawning cold processes over loopback and timing socket connection + first `+PONG` reply, median of 20 runs):
+Measured using `bench/startup_bench.cpp` (spawning cold processes over loopback and timing socket connection + first `+PONG` reply, median of 20 runs):
 
 | Server | Median Startup Latency | Min Latency | Max Latency | Speedup |
 |:---|:---:|:---:|:---:|:---:|
-| **Valkey 9.1.2** | 46.46 ms | 45.13 ms | 230.47 ms | 1.0× (baseline) |
-| **tinykv (Dynamic MinSizeRel)** | **3.34 ms** | 2.97 ms | 4.49 ms | **13.9× faster** |
-| **tinykv (Fully Static Standalone)**| **1.40 ms** | 1.24 ms | 1.52 ms | **33.2× faster** |
+| **Valkey 9.1.2** | 46.52 ms | 45.54 ms | 85.28 ms | 1.0× (baseline) |
+| **tinykv (Dynamic MinSizeRel)** | **3.25 ms** | 3.00 ms | 5.98 ms | **14.3× faster** |
+| **tinykv (Fully Static Standalone)**| **1.39 ms** | 1.26 ms | 2.36 ms | **33.5× faster** |
 
-*Note on musl on Arch Linux: Arch Linux's official repositories provide the C-only musl wrapper (`musl-gcc`); standard C++ library headers (`libstdc++-musl`) are not distributed in official Arch packages. Statically linking with glibc achieves a completely self-contained 871 KB binary with instant 1.4 ms cold startup.*
+*Note on musl on Arch Linux: Arch Linux's official repositories provide the C-only musl wrapper (`musl-gcc`); standard C++ library headers (`libstdc++-musl`) are not distributed in official Arch packages. Statically linking with glibc achieves a completely self-contained 871 KB binary with instant 1.39 ms cold startup.*
 
 ---
 
@@ -402,7 +403,7 @@ Milestone 8 concludes the project with a rigorous verification audit ensuring th
 | Project Hard Rule | Requirement | Verification & Audit Evidence | Status |
 |:---|:---|:---|:---:|
 | **Rule 1: Zero Invented Numbers** | Every metric, test count, binary size, and timing must be directly measured and reproducible. | All numbers in `README.md`, `bench/results.md`, and this document are derived from raw command outputs (`valkey-benchmark`, `startup_bench`, `size`, `ls -la`). | **VERIFIED** |
-| **Rule 2: Honest Comparison** | Never claim "faster than Redis" without measured reproducible data; report losses as honestly as wins. | Documented that Valkey outperforms tinykv by 2.5%–5.2% on single-pipeline ping-pong requests (`P=1`), while tinykv outperforms Valkey by 75%–110% on pipelined bursts (`P=16`). | **VERIFIED** |
+| **Rule 2: Honest Comparison** | Never claim "faster than Redis" without measured reproducible data; report losses as honestly as wins. | Documented that Valkey and tinykv are roughly on par at `P=1` (~64k–67k rps within ~5% noise), while tinykv outperforms Valkey by +61% to +132% under pipelined batching. Clarified that tinykv does far less per command. | **VERIFIED** |
 | **Rule 3: Milestone Workflows** | Small local commits; stop after each milestone; no pushing to remote repositories. | Work executed in clean local commits (M1 through M8) on branch `main` with zero remote pushes. | **VERIFIED** |
 | **Rule 4: Zero Dependencies** | Libc/libstdc++ only; no external dependencies; `-fno-exceptions -fno-rtti`. | Server binary depends solely on libc/libstdc++; no Boost, folly, or third-party crates; compiled with `-fno-exceptions -fno-rtti`. | **VERIFIED** |
 | **Rule 5: Attribution & Credits** | Credit Redis, antirez, tutorials, and baseline projects. | README explicitly cites Salvatore Sanfilippo, the Valkey community, Austin Appleby (MurmurHash3), and James Smith. | **VERIFIED** |

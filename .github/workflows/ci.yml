@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (Release & MinSizeRel)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Configure Release build
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_WERROR=ON
+
+      - name: Compile Release target
+        run: cmake --build build
+
+      - name: Execute test suite (Release)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Configure MinSizeRel build
+        run: cmake -B build-minsize -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DENABLE_WERROR=ON
+
+      - name: Compile MinSizeRel target
+        run: cmake --build build-minsize
+
+      - name: Execute test suite (MinSizeRel)
+        run: ctest --test-dir build-minsize --output-on-failure
+
+      - name: Verify binary size & stripped footprint
+        run: |
+          ls -lh build-minsize/tinykv
+          size build-minsize/tinykv
+
+  sanitizers:
+    name: Memory Safety (ASAN + UBSAN)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Configure Sanitizer build
+        run: cmake -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON -DENABLE_WERROR=ON
+
+      - name: Compile Sanitizer target
+        run: cmake --build build-asan
+
+      - name: Execute test suite under ASAN and UBSAN
+        run: ctest --test-dir build-asan --output-on-failure

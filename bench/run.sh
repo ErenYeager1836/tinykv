@@ -173,6 +173,8 @@ cat <<EOF > "${TMP_RESULTS}"
 - **tinykv Version**: \`v0.1.0 (Release)\`
 - **Comparison Server**: \`${COMP_SERVER_VERSION}\`
 - **Benchmark Tool**: \`$(${BENCHMARK_TOOL} --version 2>&1 | head -n 1)\`
+- **Valkey Server Flags**: \`--save "" --appendonly no --protected-mode no\` (persistence completely disabled for fair in-memory comparison)
+- **tinykv Server Flags**: \`--port ${TINYKV_PORT} --bind 127.0.0.1\` (single-threaded epoll, default slab/arena allocator)
 - **Parameters**: \`-n ${NUM_REQUESTS}\`, \`-c ${CLIENTS}\`, 5 runs per configuration (reporting median)
 
 ## Performance Comparison Table
