@@ -3,5 +3,11 @@ target_compile_options(test_echo PRIVATE ${TINYKV_COMMON_FLAGS})
 if(TINYKV_LINK_FLAGS)
     target_link_options(test_echo PRIVATE ${TINYKV_LINK_FLAGS})
 endif()
-
 add_test(NAME test_echo COMMAND test_echo $<TARGET_FILE:tinykv>)
+
+add_executable(test_epoll test_epoll.cpp)
+target_compile_options(test_epoll PRIVATE ${TINYKV_COMMON_FLAGS})
+if(TINYKV_LINK_FLAGS)
+    target_link_options(test_epoll PRIVATE ${TINYKV_LINK_FLAGS})
+endif()
+add_test(NAME test_epoll COMMAND test_epoll $<TARGET_FILE:tinykv>)
