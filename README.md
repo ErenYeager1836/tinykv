@@ -2,7 +2,7 @@
 
 A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux.
 
-> **Project Status**: Milestone 3 complete (Incremental RESP2 protocol parser & serializer, PING/ECHO/SET/GET/QUIT commands, compatibility stubs for redis-cli/redis-benchmark, fuzz tested).
+> **Project Status**: Milestone 4 complete (Custom open-addressing hash table with linear probing, dual-mode tombstone purging/rehashing, slab/arena memory allocator, zero `std::unordered_map`).
 
 ---
 

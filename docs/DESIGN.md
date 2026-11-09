@@ -193,3 +193,58 @@ Responses are constructed directly into the client's output buffer using compact
   - `QUIT`: Returns `+OK\r\n` and flags the connection to close gracefully after the reply is flushed.
 - **Client Handshake Compatibility**: `redis-cli` and `redis-benchmark` transmit `COMMAND`, `COMMAND DOCS`, `CONFIG GET`, and `CLIENT` commands on connection startup. `tinykv` handles these safely by returning valid empty array/null responses rather than returning syntax errors, allowing real redis tooling to connect and execute immediately.
 
+---
+
+## 5. Milestone 4: Custom Open-Addressing Hash Table & Slab/Arena Allocator
+
+In Milestone 4, `tinykv` completely eliminates the standard library's `std::unordered_map` and standard heap fragmentation by introducing custom, cache-friendly data structures and memory allocators.
+
+```
+                    Milestone 4 Storage Architecture
+                    
+        +-------------------------------------------------------+
+        |                tinykv::HashTable                      |
+        |  (Contiguous Entry array with linear probing)         |
+        +-------------------------------------------------------+
+        | slot 0: [Occupied | hash | key_ptr* | val_ptr* | ttl] |
+        | slot 1: [Empty]                                       |
+        | slot 2: [Tombstone] (Recycled on next insert)         |
+        | slot 3: [Occupied | hash | key_ptr* | val_ptr* | ttl] |
+        +-------------------------------------------------------+
+                     |                     |
+        Key / Value bytes allocated via Slab Allocator
+                     |                     |
+        +-------------------------------------------------------+
+        |                tinykv::SlabAllocator                  |
+        |  (Fixed-size size classes with freelist recycling)     |
+        +-------------------------------------------------------+
+        | Bin 16B:   [chunk] -> [free-list node] -> ...         |
+        | Bin 32B:   [chunk] -> [free-list node] -> ...         |
+        | Bin 64B:   [chunk] -> [free-list node] -> ...         |
+        | Bin 128B+: [chunk] -> [free-list node] -> ...         |
+        +-------------------------------------------------------+
+```
+
+### 5.1 Why Avoid `std::unordered_map`?
+1. **Separate Chaining Cache Misses**: `std::unordered_map` allocates individual bucket nodes on the heap (`std::__detail::_Hash_node`). Looking up a key requires dereferencing node pointers scattered unpredictably across memory, causing severe CPU L1/L2 data cache misses.
+2. **Allocation Overhead**: Every node requires 16–32 bytes of heap bookkeeping (node pointers, alignment, malloc chunk headers), doubling the memory footprint for small keys and values.
+3. **No Control Over Rehashing Latency**: Reallocating node arrays and rehashing cannot be coordinated with incremental expiry or custom tombstone purging.
+
+### 5.2 Open-Addressing Hash Table Mechanics
+- **Linear Probing**: Table slots are stored in a single contiguous array (`Entry* entries_`). Probing iterates contiguous cache lines, drastically reducing memory latency.
+- **Power-of-Two Capacity**: Capacity is strictly $2^k$. Index calculation uses bitwise masking (`slot = hash & (capacity - 1)`) rather than slow integer modulo operations (`%`).
+- **MurmurHash3 & Inline Hash Caching**: Computes uniform 32-bit hashes via MurmurHash3. Each slot stores `uint32_t hash`, allowing probing to compare cached integer hashes before invoking `memcmp` on string contents. During table resizing, keys do not need to be re-hashed.
+- **Tombstone Recycling**: Deleted slots are marked `SlotState::Tombstone`. When inserting a new key, the probe sequence tracks the first encountered tombstone and recycles it once verifying the key does not already exist further down the probe chain.
+- **Dual-Mode Rehash**:
+  - When total load `(size + tombstones) / capacity >= 0.70`:
+    - **Normal Expansion ($2 \times$)**: If live entries represent $\ge 35\%$ of capacity, doubles capacity to maintain fast probe chains.
+    - **In-Place Tombstone Purge**: If tombstones account for the high load while live entries are $< 35\%$, rehashes into the same capacity to purge tombstones without memory bloat.
+
+### 5.3 Memory Management: Arena & Slab Allocator
+- **`Arena`**: Sequential bump-pointer allocator for contiguous memory blocks (default 64 KB chunks). Fast $O(1)$ allocation; resetting the arena clears all memory without per-object overhead.
+- **`SlabAllocator`**: Bin-based size-class allocator (classes: 16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096 bytes).
+  - High-churn `SET`, `DEL`, and overwrite operations recycle memory through singly-linked free lists.
+  - New slots are carved out of 64 KB slab chunks.
+  - Allocations $> 4096$ bytes fall back to standard allocator.
+  - Zero heap fragmentation and instant $O(1)$ recycling for typical Redis key and value workloads.
+
