@@ -1,8 +1,8 @@
 #pragma once
 
+#include "hashtable.h"
 #include "resp.h"
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace tinykv {
@@ -18,9 +18,11 @@ public:
     // Dispatches a parsed command and appends the serialized RESP2 reply directly to out_reply
     ExecutionResult dispatch(const Command& cmd, std::vector<uint8_t>& out_reply);
 
+    [[nodiscard]] HashTable& db() noexcept { return db_; }
+    [[nodiscard]] const HashTable& db() const noexcept { return db_; }
+
 private:
-    // M3 temporary in-memory store; M4 will replace this with custom open-addressing hash table
-    std::unordered_map<std::string, std::string> db_;
+    HashTable db_;
 
     void handle_ping(const Command& cmd, std::vector<uint8_t>& out);
     void handle_echo(const Command& cmd, std::vector<uint8_t>& out);

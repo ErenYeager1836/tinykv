@@ -43,6 +43,7 @@ add_executable(tinykv
     src/server.cpp
     src/resp.cpp
     src/commands.cpp
+    src/hashtable.cpp
 )
 
 target_compile_options(tinykv PRIVATE ${TINYKV_COMMON_FLAGS})

@@ -74,8 +74,11 @@ void CommandDispatcher::handle_echo(const Command& cmd, std::vector<uint8_t>& ou
 
 void CommandDispatcher::handle_set(const Command& cmd, std::vector<uint8_t>& out) {
     if (cmd.args.size() == 3) {
-        db_[cmd.args[1]] = cmd.args[2];
-        write_simple_string(out, "OK");
+        if (db_.set(cmd.args[1], cmd.args[2])) {
+            write_simple_string(out, "OK");
+        } else {
+            write_error(out, "ERR failed to store key");
+        }
     } else {
         write_error(out, "ERR wrong number of arguments for 'set' command");
     }
@@ -83,9 +86,9 @@ void CommandDispatcher::handle_set(const Command& cmd, std::vector<uint8_t>& out
 
 void CommandDispatcher::handle_get(const Command& cmd, std::vector<uint8_t>& out) {
     if (cmd.args.size() == 2) {
-        auto it = db_.find(cmd.args[1]);
-        if (it != db_.end()) {
-            write_bulk_string(out, it->second);
+        const auto* entry = db_.get(cmd.args[1]);
+        if (entry != nullptr) {
+            write_bulk_string(out, entry->val_view());
         } else {
             write_null_bulk_string(out);
         }
