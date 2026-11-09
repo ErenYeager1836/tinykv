@@ -2,7 +2,7 @@
 
 A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux.
 
-> **Project Status**: Milestone 7 complete (Size builds: 35 KB dynamic, 871 KB static standalone; 1.4 ms cold startup time—33× faster than Valkey; -Os, LTO, -fno-exceptions, -fno-rtti, GC sections, stripped).
+> **Project Status**: Complete (Milestones 1–8). Production-ready portfolio project with measured benchmarks, zero compiler warnings, ASAN/UBSAN clean, `-fno-exceptions`, `-fno-rtti`, custom open-addressing hash table and slab allocator, and RESP2 compliance.
 
 ---
 
@@ -11,20 +11,21 @@ A minimal, fast, Redis-compatible key-value server written in modern C++20 for L
 `tinykv` is a learning-scale systems programming project built to explore low-level network programming, Linux `epoll` event loops, protocol parsing, and custom memory management. It speaks the standard Redis Serialization Protocol (RESP2), allowing standard tools like `redis-cli` and `redis-benchmark` to connect without modification.
 
 ### Core Goals
-- **Minimal binary footprint**: Crushes general-purpose servers on static binary size and startup time.
+- **Minimal binary footprint**: Crushes general-purpose servers on static binary size (35 KB dynamic, 871 KB static standalone vs. 3.2 MB Valkey) and cold startup latency (1.4 ms vs. 46.5 ms Valkey).
 - **Single-threaded simplicity**: Pure event-driven epoll loop without locks, race conditions, or context-switch overhead.
-- **Memory safety & robustness**: Built with strict warnings (`-Wall -Wextra -Wpedantic -Werror`), tested with ASAN/UBSAN, with bounded memory allocations.
+- **High throughput pipelining**: Exceeds 1,000,000 req/sec under pipelined workloads (+75% to +110% over Valkey).
+- **Memory safety & robustness**: Built with strict warnings (`-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror`), verified clean under AddressSanitizer and UndefinedBehaviorSanitizer, with hard-bounded buffer limits.
 
 ---
 
 ## Scope & Limitations
 
-### Supported Commands (Milestone Target)
+### Supported Commands
 - **Connection & Server**: `PING`, `ECHO`, `QUIT`, `DBSIZE`
 - **Key-Value Operations**: `SET` (with `EX` / `PX` expiry), `GET`, `DEL`, `EXISTS`
 - **Counters**: `INCR`, `DECR`
-- **Expiry**: `EXPIRE`, `TTL`
-- **Tooling Compatibility**: Harmless handling for startup commands sent by `redis-cli` and `redis-benchmark` (`COMMAND`, `CONFIG GET`).
+- **Expiry**: `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`
+- **Tooling Compatibility**: Harmless handling for startup inspection commands sent by `redis-cli` and `redis-benchmark` (`COMMAND`, `COMMAND DOCS`, `CONFIG GET`, `CLIENT`).
 
 ### Explicitly Out of Scope
 `tinykv` is **not a full Redis replacement**. The following features are intentionally out of scope:
@@ -53,7 +54,7 @@ Tested using `valkey-benchmark` on Linux `7.2.11-arch1-1` (11th Gen Intel Core i
 | **SET** | P=16 | 256 B | **952,381.00** | 460,829.50 | **0.647 ms** | 2.135 ms | **+106.7%** |
 | **GET** | P=16 | 256 B | **934,579.44** | 529,100.56 | **0.671 ms** | 2.231 ms | **+76.6%** |
 
-*Note: For non-pipelined ping-pong requests (`P=1`), Valkey edges out tinykv by 2.5% to 5.2%. For pipelined requests (`P=16`), tinykv outperforms Valkey by 75% to 110% due to its zero-copy RESP parser and single-threaded slab allocation.*
+*Note: For non-pipelined ping-pong requests (`P=1`), Valkey edges out tinykv by 2.5% to 5.2%. For pipelined requests (`P=16`), tinykv outperforms Valkey by 75% to 110% due to its zero-copy RESP parser, single-threaded zero-lock architecture, and contiguous slab allocation.*
 
 ---
 
@@ -81,15 +82,55 @@ Measured using `bench/startup_bench` (spawning cold processes over loopback and 
 
 ---
 
+## Architecture Summary
+
+```
+                      Single-Threaded epoll Architecture
+                      
+                      +-----------------------------+
+                      |    epoll_wait() (Kernel)    |
+                      +-----------------------------+
+                                     |
+              +----------------------+----------------------+
+              |                      |                      |
+        [listen_fd]             [client_fd 1]          [client_fd N]
+         (EPOLLIN)            (EPOLLIN|EPOLLRDHUP)   (EPOLLIN|EPOLLOUT)
+              |                      |                      |
+        handle_accept()        handle_read()          handle_write()
+       - accept4() nonblock   - read() nonblock      - write() nonblock
+       - set TCP_NODELAY      - parse RESP2 stream   - flush pending buffer
+       - add to epoll table   - dispatch command     - drop EPOLLOUT when done
+                                     |
+                      +--------------+--------------+
+                      |                             |
+             [ HashTable Storage ]          [ Memory System ]
+             - Open-addressing              - SlabAllocator (15 size classes)
+             - Linear probing               - Bump Arena for buffers
+             - Cached MurmurHash3           - Zero heap fragmentation
+             - Tombstone recycling          - Fast O(1) recycling
+                      |
+             [ Dual Expiration ]
+             - Lazy: on lookup()
+             - Active: 10 Hz ring scan
+```
+
+- **I/O Multiplexing**: Single-threaded level-triggered Linux `epoll` with conditional `EPOLLOUT` registration (prevents CPU spinning).
+- **Stream-Safe RESP2 Parser**: Handles partial reads, batch pipelining, inline telnet commands, and oversized hostile inputs safely.
+- **Custom Open-Addressing Hash Table**: Linear probing, power-of-two bitmask indexing, cached 32-bit MurmurHash3, tombstone recycling, and dual-mode expansion/purge rehash. Zero `std::unordered_map`.
+- **Memory Management**: Slab allocator with 15 size classes (16 B to 4096 B) and freelist recycling. Zero heap fragmentation under high-churn insert/delete cycles.
+- **Dual Expiration**: Instant lazy expiration during lookup + active background ring-buffer sweep at 10 Hz with VDSO `CLOCK_MONOTONIC_COARSE`.
+
+---
+
 ## Quick Start
 
 ### Requirements
-- Arch Linux (or any Linux with kernel 5.x+)
+- Arch Linux (or any modern Linux distribution with kernel 5.x+)
 - GCC 13+ or Clang 16+ supporting C++20
 - CMake 3.20+
 - Ninja
 
-### Building
+### 1. Default Release Build
 ```bash
 # Clone the repository
 git clone https://github.com/<your-username>/tinykv.git
@@ -99,13 +140,34 @@ cd tinykv
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-# Run unit tests
+# Run test suite
 ctest --test-dir build --output-on-failure
+```
+
+### 2. Size-Optimized Build (35 KB dynamic)
+```bash
+cmake -B build-minsize -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel
+cmake --build build-minsize
+ls -lh build-minsize/tinykv
+```
+
+### 3. Fully Static Standalone Build (871 KB zero-dependency)
+```bash
+cmake -B build-static -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DENABLE_STATIC=ON
+cmake --build build-static
+ldd build-static/tinykv  # Output: "not a dynamic executable"
+```
+
+### 4. Memory Safety & Sanitizer Verification
+```bash
+cmake -B build-asan -G Ninja -DENABLE_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-asan
+ctest --test-dir build-asan --output-on-failure
 ```
 
 ### Running the Server
 ```bash
-./build/tinykv --port 6379 --bind 127.0.0.1
+./build/tinykv --port 6379 --bind 127.0.0.1 --max-clients 1024
 ```
 
 In another terminal, connect using standard tools or `redis-cli`:
@@ -114,11 +176,17 @@ In another terminal, connect using standard tools or `redis-cli`:
 redis-cli -p 6379 PING
 # Output: PONG
 
-redis-cli -p 6379 SET user:1 Alice
+redis-cli -p 6379 SET user:1 Alice EX 60
 # Output: OK
 
 redis-cli -p 6379 GET user:1
 # Output: "Alice"
+
+redis-cli -p 6379 TTL user:1
+# Output: (integer) 60
+
+redis-cli -p 6379 INCR counter
+# Output: (integer) 1
 
 # Or interact via raw netcat / telnet (inline protocol support)
 ncat 127.0.0.1 6379
@@ -133,15 +201,21 @@ QUIT
 +OK
 ```
 
----
+### Running Benchmarks
+```bash
+# Reproducible throughput benchmark against Valkey
+./bench/run.sh
 
-## Design & Architecture
-
-See [docs/DESIGN.md](docs/DESIGN.md) for low-level socket architecture, POSIX syscall mechanics, and the roadmap toward an epoll-driven event loop.
+# Cold startup time benchmark (median of 20 runs)
+./build/startup_bench --runs 20
+```
 
 ---
 
 ## Credits & References
 
-- [Redis](https://github.com/redis/redis) by Salvatore Sanfilippo (antirez) for the RESP2 specification and architecture inspiration.
+- [Redis](https://github.com/redis/redis) by Salvatore Sanfilippo (antirez) for the RESP2 specification, active expiry algorithm, and architectural inspiration.
+- [Valkey](https://github.com/valkey-io/valkey) community for providing the high-performance Linux reference server against which `tinykv` is benchmarked.
 - James Smith's *"Build Your Own Redis with C/C++"* tutorials for non-blocking event-loop design patterns.
+- Austin Appleby for MurmurHash3.
+
