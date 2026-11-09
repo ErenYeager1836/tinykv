@@ -4,7 +4,9 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -17,23 +19,61 @@ Server::~Server() {
     stop();
 }
 
+int Server::set_nonblocking(int fd) {
+    // Retrieve current socket file status flags
+    int flags = ::fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        std::fprintf(stderr, "[ERROR] fcntl(F_GETFL, fd=%d) failed: %s\n", fd, std::strerror(errno));
+        return -1;
+    }
+    // Set O_NONBLOCK: subsequent read(), write(), or accept() operations will
+    // return immediately with EAGAIN/EWOULDBLOCK instead of blocking the thread.
+    if (::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        std::fprintf(stderr, "[ERROR] fcntl(F_SETFL, O_NONBLOCK, fd=%d) failed: %s\n", fd, std::strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int Server::epoll_add(int fd, uint32_t events) {
+    struct epoll_event ev{};
+    ev.events = events;
+    ev.data.fd = fd;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        std::fprintf(stderr, "[ERROR] epoll_ctl(ADD, fd=%d) failed: %s\n", fd, std::strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int Server::epoll_mod(int fd, uint32_t events) {
+    struct epoll_event ev{};
+    ev.events = events;
+    ev.data.fd = fd;
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
+        std::fprintf(stderr, "[ERROR] epoll_ctl(MOD, fd=%d) failed: %s\n", fd, std::strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+int Server::epoll_del(int fd) {
+    struct epoll_event ev{};
+    if (::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, &ev) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int Server::init() {
-    // 1. Create the listening socket endpoint.
-    // AF_INET: IPv4 Internet protocols.
-    // SOCK_STREAM: Provides sequenced, reliable, two-way, connection-based byte streams (TCP).
-    // Protocol 0: Automatically selects default protocol for AF_INET + SOCK_STREAM (IPPROTO_TCP).
+    // 1. Create IPv4 TCP socket
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd_ < 0) {
         std::fprintf(stderr, "[ERROR] socket() failed: %s (errno=%d)\n", std::strerror(errno), errno);
         return -1;
     }
 
-    // 2. Enable SO_REUSEADDR on the listening socket.
-    // When a TCP server shuts down or restarts, sockets recently closed enter the TIME_WAIT
-    // state (typically 30-120 seconds) to ensure delayed packets in transit do not corrupt
-    // subsequent connections. Without SO_REUSEADDR, re-binding to the same port immediately
-    // results in EADDRINUSE ("Address already in use"). SO_REUSEADDR permits binding as long
-    // as no active listening socket is already bound to the exact same local tuple.
+    // 2. SO_REUSEADDR allows immediate re-binding during TIME_WAIT state
     int opt = 1;
     if (::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
         std::fprintf(stderr, "[ERROR] setsockopt(SO_REUSEADDR) failed: %s\n", std::strerror(errno));
@@ -42,11 +82,17 @@ int Server::init() {
         return -1;
     }
 
-    // 3. Configure the address structure and bind to local address and port.
-    // sockaddr_in defines IPv4 socket addressing.
-    // sin_family must be AF_INET.
-    // sin_port must be in Network Byte Order (Big Endian), converted via htons().
-    // sin_addr is converted from text representation using inet_pton().
+    // 3. Make listening socket non-blocking.
+    // If a client sends SYN then aborts (RST) before accept() runs, a blocking
+    // accept() would freeze the entire event loop. Non-blocking mode ensures
+    // accept() returns immediately with EAGAIN if no connection remains queued.
+    if (set_nonblocking(listen_fd_) < 0) {
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        return -1;
+    }
+
+    // 4. Bind address and port
     struct sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(config_.port);
@@ -58,7 +104,6 @@ int Server::init() {
         return -1;
     }
 
-    // bind() assigns the transport address (IP and port) to the socket file descriptor.
     if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         std::fprintf(stderr, "[ERROR] bind() to %s:%u failed: %s (errno=%d)\n",
                      config_.host.c_str(), config_.port, std::strerror(errno), errno);
@@ -67,11 +112,7 @@ int Server::init() {
         return -1;
     }
 
-    // 4. Mark socket as passive listening socket to accept incoming connections.
-    // listen() transitions the socket state from active (connecting) to passive (listening).
-    // The second parameter (backlog) defines the maximum queue length for pending,
-    // unaccepted connections (SYN_RCVD and ESTABLISHED queues). We use SOMAXCONN (Linux
-    // system limit configured in /proc/sys/net/core/somaxconn, typically 4096 on modern Linux).
+    // 5. Mark socket passive with SOMAXCONN backlog queue
     if (::listen(listen_fd_, SOMAXCONN) < 0) {
         std::fprintf(stderr, "[ERROR] listen() failed: %s\n", std::strerror(errno));
         ::close(listen_fd_);
@@ -79,110 +120,279 @@ int Server::init() {
         return -1;
     }
 
-    std::printf("[INFO] tinykv listening on %s:%u (fd=%d, backlog=%d)\n",
-                config_.host.c_str(), config_.port, listen_fd_, SOMAXCONN);
+    // 6. Create epoll instance with EPOLL_CLOEXEC
+    epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
+    if (epoll_fd_ < 0) {
+        std::fprintf(stderr, "[ERROR] epoll_create1 failed: %s\n", std::strerror(errno));
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        return -1;
+    }
+
+    // 7. Register listening socket for EPOLLIN (incoming connection readiness)
+    if (epoll_add(listen_fd_, EPOLLIN) < 0) {
+        ::close(epoll_fd_);
+        ::close(listen_fd_);
+        epoll_fd_ = -1;
+        listen_fd_ = -1;
+        return -1;
+    }
+
+    // Pre-allocate connection table to comfortably index by file descriptor
+    conns_.resize(static_cast<size_t>(config_.max_clients + 128));
+
+    std::printf("[INFO] tinykv listening on %s:%u (fd=%d, epoll_fd=%d, max_clients=%d)\n",
+                config_.host.c_str(), config_.port, listen_fd_, epoll_fd_, config_.max_clients);
     return 0;
 }
 
 int Server::run() {
-    if (listen_fd_ < 0) {
+    if (listen_fd_ < 0 || epoll_fd_ < 0) {
         std::fprintf(stderr, "[ERROR] Server::run() called before successful init()\n");
         return -1;
     }
 
     running_ = true;
+    struct epoll_event events[kDefaultEpollEvents];
 
-    // Blocking connection accept loop (M1 baseline)
     while (running_) {
+        // Wait indefinitely until I/O events occur or a signal interrupts the wait
+        int nfds = ::epoll_wait(epoll_fd_, events, kDefaultEpollEvents, -1);
+        if (nfds < 0) {
+            if (errno == EINTR) {
+                // Interrupted by signal (SIGINT, SIGTERM)
+                if (!running_) {
+                    break;
+                }
+                continue;
+            }
+            std::fprintf(stderr, "[ERROR] epoll_wait error: %s (errno=%d)\n", std::strerror(errno), errno);
+            break;
+        }
+
+        for (int i = 0; i < nfds; ++i) {
+            int fd = events[i].data.fd;
+            uint32_t ev = events[i].events;
+
+            if (fd == listen_fd_) {
+                // Ready for new client connections
+                handle_accept();
+            } else {
+                // Client socket event
+                if (ev & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+                    close_connection(fd);
+                    continue;
+                }
+
+                if (ev & EPOLLIN) {
+                    handle_read(fd);
+                }
+
+                // If connection remains open and has pending write events
+                if ((ev & EPOLLOUT) && is_connected(fd)) {
+                    handle_write(fd);
+                }
+            }
+        }
+    }
+
+    cleanup_all_connections();
+    return 0;
+}
+
+void Server::handle_accept() {
+    // Level-triggered: loop accept4() until EAGAIN to drain all queued connections
+    while (true) {
         struct sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
 
-        // accept() blocks until an incoming connection arrives on the listening queue.
-        // It returns a BRAND NEW file descriptor referring to the established connection
-        // with this specific peer. The original listen_fd_ remains open and unchanged,
-        // ready to accept more connections.
-        int client_fd = ::accept(listen_fd_, reinterpret_cast<struct sockaddr*>(&client_addr), &client_len);
+        // accept4 creates the socket atomically with non-blocking and close-on-exec flags
+        int client_fd = ::accept4(listen_fd_,
+                                  reinterpret_cast<struct sockaddr*>(&client_addr),
+                                  &client_len,
+                                  SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (client_fd < 0) {
-            if (errno == EINTR) {
-                // Interrupted by signal (e.g., SIGINT/SIGTERM for shutdown)
-                continue;
-            }
-            if (!running_) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // All pending connections have been accepted
                 break;
             }
-            std::fprintf(stderr, "[WARN] accept() failed: %s\n", std::strerror(errno));
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EMFILE || errno == ENFILE) {
+                std::fprintf(stderr, "[WARN] File descriptor limit reached during accept4()\n");
+                break;
+            }
+            std::fprintf(stderr, "[WARN] accept4() failed: %s\n", std::strerror(errno));
+            break;
+        }
+
+        // Hard limit on maximum concurrent clients
+        if (active_clients_ >= config_.max_clients) {
+            std::fprintf(stderr, "[WARN] Max clients limit (%d) reached. Dropping fd=%d\n",
+                         config_.max_clients, client_fd);
+            ::close(client_fd);
             continue;
         }
+
+        // Ensure connection table has room for this file descriptor
+        if (static_cast<size_t>(client_fd) >= conns_.size()) {
+            conns_.resize(static_cast<size_t>(client_fd) + 128);
+        }
+
+        // Initialize connection state
+        auto conn = std::make_unique<Connection>(client_fd);
+        conn->epoll_events = EPOLLIN | EPOLLRDHUP;
+
+        // Register in epoll with EPOLLIN and EPOLLRDHUP (fast disconnect detection)
+        if (epoll_add(client_fd, conn->epoll_events) < 0) {
+            ::close(client_fd);
+            continue;
+        }
+
+        conns_[static_cast<size_t>(client_fd)] = std::move(conn);
+        ++active_clients_;
 
         char client_ip[INET_ADDRSTRLEN]{};
         ::inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         uint16_t client_port = ntohs(client_addr.sin_port);
 
-        std::printf("[INFO] Accepted client connection from %s:%u (fd=%d)\n",
-                    client_ip, client_port, client_fd);
-
-        handle_client(client_fd);
+        std::printf("[INFO] Accepted non-blocking client from %s:%u (fd=%d, active=%d)\n",
+                    client_ip, client_port, client_fd, active_clients_);
     }
-
-    return 0;
 }
 
-void Server::handle_client(int client_fd) {
-    // Blocking echo loop:
-    // Reads bytes from client_fd and immediately echoes them back.
-    // TCP is a stream protocol without message boundaries:
-    // - read() returns 0 on EOF (clean client disconnect / FIN).
-    // - read() returns -1 on error.
-    // - A single write() must loop until all read bytes are transmitted.
-    constexpr size_t kBufferSize = 4096;
-    char buffer[kBufferSize];
+void Server::handle_read(int fd) {
+    if (!is_connected(fd)) {
+        return;
+    }
+    Connection& conn = *conns_[static_cast<size_t>(fd)];
 
-    while (running_) {
-        ssize_t bytes_read = ::read(client_fd, buffer, sizeof(buffer));
-        if (bytes_read == 0) {
-            // EOF: client sent FIN packet (closed write half of connection)
-            std::printf("[INFO] Client on fd=%d disconnected cleanly (EOF)\n", client_fd);
-            break;
-        }
-        if (bytes_read < 0) {
+    uint8_t buffer[4096];
+    while (true) {
+        ssize_t bytes_read = ::read(fd, buffer, sizeof(buffer));
+        if (bytes_read > 0) {
+            // Enforce maximum buffer limit per client to prevent OOM DOS
+            if (conn.read_buf.size() + static_cast<size_t>(bytes_read) > kMaxClientBufferSize) {
+                std::fprintf(stderr, "[WARN] Client fd=%d exceeded buffer limit (%zu bytes). Terminating.\n",
+                             fd, kMaxClientBufferSize);
+                close_connection(fd);
+                return;
+            }
+
+            conn.read_buf.insert(conn.read_buf.end(), buffer, buffer + bytes_read);
+        } else if (bytes_read == 0) {
+            // EOF: client performed clean shutdown
+            close_connection(fd);
+            return;
+        } else {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Socket receive buffer drained
+                break;
+            }
             if (errno == EINTR) {
                 continue;
             }
-            std::fprintf(stderr, "[WARN] read() error on fd=%d: %s\n", client_fd, std::strerror(errno));
-            break;
-        }
-
-        // Echo the exact bytes back to the client.
-        // In TCP, write() may transmit fewer bytes than requested (short write),
-        // so we loop until all bytes_read are confirmed written.
-        size_t total_written = 0;
-        const size_t to_write = static_cast<size_t>(bytes_read);
-        bool write_error = false;
-
-        while (total_written < to_write) {
-            ssize_t written = ::write(client_fd, buffer + total_written, to_write - total_written);
-            if (written < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                std::fprintf(stderr, "[WARN] write() error on fd=%d: %s\n", client_fd, std::strerror(errno));
-                write_error = true;
-                break;
-            }
-            total_written += static_cast<size_t>(written);
-        }
-
-        if (write_error) {
-            break;
+            // Error reading socket (e.g. ECONNRESET)
+            close_connection(fd);
+            return;
         }
     }
 
-    // Close the client connection and release its file descriptor back to the OS table.
-    ::close(client_fd);
+    // In M2: Echo mode (transfer read buffer directly to write buffer)
+    if (!conn.read_buf.empty()) {
+        conn.write_buf.insert(conn.write_buf.end(), conn.read_buf.begin(), conn.read_buf.end());
+        conn.read_buf.clear();
+
+        // Attempt non-blocking write immediately
+        handle_write(fd);
+    }
+}
+
+void Server::handle_write(int fd) {
+    if (!is_connected(fd)) {
+        return;
+    }
+    Connection& conn = *conns_[static_cast<size_t>(fd)];
+
+    while (conn.write_offset < conn.write_buf.size()) {
+        const size_t to_write = conn.write_buf.size() - conn.write_offset;
+        ssize_t written = ::write(fd, conn.write_buf.data() + conn.write_offset, to_write);
+
+        if (written > 0) {
+            conn.write_offset += static_cast<size_t>(written);
+        } else if (written < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Kernel send buffer is full. Register EPOLLOUT so epoll notifies
+                // us when the socket becomes writable again.
+                if (!(conn.epoll_events & EPOLLOUT)) {
+                    conn.epoll_events |= EPOLLOUT;
+                    epoll_mod(fd, conn.epoll_events);
+                }
+                return;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            // Connection broken (e.g. EPIPE)
+            close_connection(fd);
+            return;
+        }
+    }
+
+    // Full write buffer has been flushed to the socket
+    conn.write_buf.clear();
+    conn.write_offset = 0;
+
+    // CRITICAL for level-triggered epoll:
+    // If EPOLLOUT is enabled, epoll_wait will trigger continuously (sockets are
+    // almost always writable). Once all data is written, EPOLLOUT MUST be cleared.
+    if (conn.epoll_events & EPOLLOUT) {
+        conn.epoll_events &= ~static_cast<uint32_t>(EPOLLOUT);
+        epoll_mod(fd, conn.epoll_events);
+    }
+}
+
+void Server::close_connection(int fd) {
+    if (!is_connected(fd)) {
+        return;
+    }
+
+    // Unregister from epoll
+    epoll_del(fd);
+
+    // Close socket
+    ::close(fd);
+
+    // Free connection state
+    conns_[static_cast<size_t>(fd)].reset();
+    --active_clients_;
+
+    std::printf("[INFO] Closed connection fd=%d (active=%d)\n", fd, active_clients_);
+}
+
+void Server::cleanup_all_connections() {
+    for (size_t i = 0; i < conns_.size(); ++i) {
+        if (conns_[i]) {
+            int fd = conns_[i]->fd;
+            epoll_del(fd);
+            ::close(fd);
+            conns_[i].reset();
+        }
+    }
+    active_clients_ = 0;
 }
 
 void Server::stop() {
     running_ = false;
+
+    cleanup_all_connections();
+
+    if (epoll_fd_ >= 0) {
+        ::close(epoll_fd_);
+        epoll_fd_ = -1;
+    }
+
     if (listen_fd_ >= 0) {
         ::close(listen_fd_);
         listen_fd_ = -1;
