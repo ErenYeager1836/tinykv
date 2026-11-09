@@ -31,6 +31,8 @@ struct Entry {
     }
 };
 
+static_assert(sizeof(Entry) == 48, "Entry struct must be 48 bytes");
+
 class HashTable {
 public:
     static constexpr size_t kDefaultInitialCapacity = 16;
