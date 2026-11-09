@@ -11,13 +11,15 @@ namespace tinykv {
 
 namespace {
 
-std::string to_upper(std::string_view sv) {
-    std::string s;
-    s.reserve(sv.size());
-    for (char c : sv) {
-        s.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+bool iequals(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
     }
-    return s;
+    return true;
 }
 
 bool parse_int64(std::string_view sv, int64_t& out) {
@@ -65,48 +67,49 @@ ExecutionResult CommandDispatcher::dispatch(const Command& cmd, std::vector<uint
         return result;
     }
 
-    std::string command_name = to_upper(cmd.args[0]);
+    std::string_view name = cmd.args[0];
 
-    if (command_name == "PING") {
-        handle_ping(cmd, out_reply);
-    } else if (command_name == "ECHO") {
-        handle_echo(cmd, out_reply);
-    } else if (command_name == "SET") {
-        handle_set(cmd, out_reply);
-    } else if (command_name == "GET") {
+    // Branch prediction optimization: order by frequency (GET/SET first)
+    if (iequals(name, "GET")) {
         handle_get(cmd, out_reply);
-    } else if (command_name == "DEL") {
+    } else if (iequals(name, "SET")) {
+        handle_set(cmd, out_reply);
+    } else if (iequals(name, "PING")) {
+        handle_ping(cmd, out_reply);
+    } else if (iequals(name, "DEL")) {
         handle_del(cmd, out_reply);
-    } else if (command_name == "EXISTS") {
+    } else if (iequals(name, "EXISTS")) {
         handle_exists(cmd, out_reply);
-    } else if (command_name == "INCR") {
+    } else if (iequals(name, "INCR")) {
         handle_incr(cmd, out_reply);
-    } else if (command_name == "DECR") {
+    } else if (iequals(name, "DECR")) {
         handle_decr(cmd, out_reply);
-    } else if (command_name == "EXPIRE") {
+    } else if (iequals(name, "ECHO")) {
+        handle_echo(cmd, out_reply);
+    } else if (iequals(name, "EXPIRE")) {
         handle_expire(cmd, out_reply, false);
-    } else if (command_name == "PEXPIRE") {
+    } else if (iequals(name, "PEXPIRE")) {
         handle_expire(cmd, out_reply, true);
-    } else if (command_name == "TTL") {
+    } else if (iequals(name, "TTL")) {
         handle_ttl(cmd, out_reply, false);
-    } else if (command_name == "PTTL") {
+    } else if (iequals(name, "PTTL")) {
         handle_ttl(cmd, out_reply, true);
-    } else if (command_name == "DBSIZE") {
+    } else if (iequals(name, "DBSIZE")) {
         handle_dbsize(cmd, out_reply);
-    } else if (command_name == "QUIT") {
+    } else if (iequals(name, "QUIT")) {
         write_simple_string(out_reply, "OK");
         result.close_connection = true;
-    } else if (command_name == "COMMAND") {
+    } else if (iequals(name, "COMMAND")) {
         // Compatibility handler for redis-cli / redis-benchmark probing commands at startup
         write_empty_array(out_reply);
-    } else if (command_name == "CONFIG") {
+    } else if (iequals(name, "CONFIG")) {
         // Compatibility handler for CONFIG GET
         write_empty_array(out_reply);
-    } else if (command_name == "CLIENT") {
+    } else if (iequals(name, "CLIENT")) {
         // Compatibility handler for CLIENT SETINFO / CLIENT LIST
         write_simple_string(out_reply, "OK");
     } else {
-        std::string err_msg = "ERR unknown command '" + cmd.args[0] + "'";
+        std::string err_msg = "ERR unknown command '" + std::string(name) + "'";
         write_error(out_reply, err_msg);
     }
 
@@ -159,16 +162,15 @@ void CommandDispatcher::handle_set(const Command& cmd, std::vector<uint8_t>& out
         }
     } else if (cmd.args.size() == 5) {
         // SET key value EX seconds | PX milliseconds
-        std::string opt = to_upper(cmd.args[3]);
         int64_t t = 0;
         if (!parse_int64(cmd.args[4], t) || t <= 0) {
             write_error(out, "ERR value is not an integer or out of range");
             return;
         }
         uint64_t now_ms = get_monotonic_time_ms();
-        if (opt == "EX") {
+        if (iequals(cmd.args[3], "EX")) {
             expire_at_ms = now_ms + static_cast<uint64_t>(t) * 1000ULL;
-        } else if (opt == "PX") {
+        } else if (iequals(cmd.args[3], "PX")) {
             expire_at_ms = now_ms + static_cast<uint64_t>(t);
         } else {
             write_error(out, "ERR syntax error");
