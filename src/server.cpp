@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -232,6 +233,10 @@ void Server::handle_accept() {
             break;
         }
 
+        // Disable Nagle's algorithm for low-latency request-response streaming
+        int nodelay = 1;
+        ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
         // Hard limit on maximum concurrent clients
         if (active_clients_ >= config_.max_clients) {
             std::fprintf(stderr, "[WARN] Max clients limit (%d) reached. Dropping fd=%d\n",
@@ -305,14 +310,16 @@ void Server::handle_read(int fd) {
     }
 
     // Incremental RESP2 parsing loop: processes all complete commands in read_buf
-    while (!conn.read_buf.empty()) {
+    size_t offset = 0;
+    while (offset < conn.read_buf.size()) {
         size_t consumed = 0;
         Command cmd;
-        ParseStatus status = parse_resp(conn.read_buf.data(), conn.read_buf.size(), consumed, cmd);
+        ParseStatus status = parse_resp(conn.read_buf.data() + offset,
+                                        conn.read_buf.size() - offset,
+                                        consumed, cmd);
 
         if (status == ParseStatus::kOk) {
-            conn.read_buf.erase(conn.read_buf.begin(),
-                                conn.read_buf.begin() + static_cast<std::ptrdiff_t>(consumed));
+            offset += consumed;
             if (!cmd.args.empty()) {
                 ExecutionResult res = dispatcher_.dispatch(cmd, conn.write_buf);
                 if (res.close_connection) {
@@ -326,7 +333,17 @@ void Server::handle_read(int fd) {
             // Protocol error or security violation
             write_error(conn.write_buf, "ERR Protocol error: invalid stream or length");
             conn.close_after_write = true;
+            offset = conn.read_buf.size();
             break;
+        }
+    }
+
+    if (offset > 0) {
+        if (offset >= conn.read_buf.size()) {
+            conn.read_buf.clear();
+        } else {
+            conn.read_buf.erase(conn.read_buf.begin(),
+                                conn.read_buf.begin() + static_cast<std::ptrdiff_t>(offset));
         }
     }
 
