@@ -5,9 +5,8 @@ bin/
 *.a
 *.so
 
-# Executables
-tinykv
-test_*
+# Root executables
+/tinykv
 
 # IDE / Editor
 .vscode/
