@@ -2,7 +2,7 @@
 
 A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux.
 
-> **Project Status**: Milestone 1 complete (Repo skeleton, CMake build system, POSIX TCP blocking echo baseline).
+> **Project Status**: Milestone 2 complete (Single-threaded non-blocking epoll event loop, per-connection dynamic buffers, multi-client multiplexing, clean signal shutdown).
 
 ---
 

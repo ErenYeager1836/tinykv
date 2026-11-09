@@ -77,14 +77,51 @@ Milestone 1 establishes a blocking TCP server to demonstrate low-level POSIX soc
 
 ---
 
-## 3. Transition to Milestone 2: Why Non-Blocking epoll?
+## 3. Milestone 2: Single-Threaded Non-Blocking epoll Event Loop
 
-The blocking server implemented in M1 has a fundamental scaling limitation:
-- While `handle_client()` is inside `read(client_fd)`, the entire thread blocks waiting on network I/O from that single client.
-- Other clients queued in `listen()` cannot be accepted.
-- Multi-threading or forking per client wastes substantial memory (thread stack overhead) and incurs severe kernel context-switching latency.
+In Milestone 2, `tinykv` transitioned from sequential blocking I/O to a high-concurrency, single-threaded Linux `epoll` event loop.
 
-### The Solution (M2):
-- Set all file descriptors to non-blocking mode: `fcntl(fd, F_SETFL, O_NONBLOCK)`.
-- Use Linux `epoll` (`epoll_create1`, `epoll_ctl`, `epoll_wait`) to monitor hundreds or thousands of connections on a single thread.
-- `epoll_wait()` notifies the server only when a socket is actually ready to read or write without blocking.
+```
+                    Single-Threaded epoll Architecture
+                    
+                    +-----------------------------+
+                    |    epoll_wait() (Kernel)    |
+                    +-----------------------------+
+                                   |
+            +----------------------+----------------------+
+            |                      |                      |
+      [listen_fd]             [client_fd 1]          [client_fd N]
+       (EPOLLIN)            (EPOLLIN|EPOLLRDHUP)   (EPOLLIN|EPOLLOUT)
+            |                      |                      |
+      handle_accept()        handle_read()          handle_write()
+     - accept4() in loop    - read() until EAGAIN  - write() until EAGAIN
+     - SOCK_NONBLOCK        - append to read_buf   - track write_offset
+     - SOCK_CLOEXEC         - check 1MB limit      - remove EPOLLOUT when
+     - add to epoll table   - queue response         buffer is drained
+```
+
+### 3.1 Level-Triggered Event Notification Mechanics
+1. **Conditional `EPOLLOUT` Registration**:
+   - In level-triggered epoll, a socket send buffer is almost always writable.
+   - If `EPOLLOUT` is permanently registered on a client socket, `epoll_wait()` returns immediately every single cycle, spinning the CPU at 100% utilization.
+   - **tinykv rule**: Sockets register interest in `EPOLLIN | EPOLLRDHUP` by default. `EPOLLOUT` is added (`epoll_ctl(MOD)`) **only** when a `write()` call returns `EAGAIN` / `EWOULDBLOCK` (indicating kernel socket send buffers are saturated). As soon as the pending write buffer is fully flushed, `EPOLLOUT` is cleared immediately.
+
+2. **Draining Queues with Non-Blocking Loops**:
+   - **Accept Loop**: `handle_accept()` calls `accept4(listen_fd, ..., SOCK_NONBLOCK | SOCK_CLOEXEC)` in a loop until `EAGAIN` / `EWOULDBLOCK`, ensuring all simultaneous incoming connection bursts are ingested without latency.
+   - **Read Loop**: `handle_read(fd)` drains all available bytes into the connection's `read_buf` until `read()` returns `EAGAIN`.
+
+3. **Fast Disconnect Detection (`EPOLLRDHUP`)**:
+   - Registered on Linux to detect when a remote peer closes their write-side of the connection (`SHUT_WR` / FIN packet) directly from the event loop, avoiding wasted read attempts.
+
+4. **Resource Bounds & DoS Resistance**:
+   - `kMaxClientBufferSize` (1 MB) limits the dynamic growth of per-connection buffers. A client that streams unbounded data without reading replies is abruptly disconnected before causing out-of-memory (OOM) kernel panics.
+   - `config.max_clients` rejects new connections beyond the user's limit before allocating connection state.
+
+---
+
+## 4. Transition to Milestone 3: RESP2 Protocol Engine
+
+In Milestone 3, the raw byte echo logic is replaced with an incremental Redis Serialization Protocol (RESP2) parser and reply serialization engine:
+- Stateful stream parsing supporting chunked/fragmented packets and pipelined batches.
+- Initial commands: `PING`, `ECHO`, `SET`, `GET`.
+- Protocol fuzz testing to ensure zero memory corruption or unhandled crashes on adversarial payloads.
