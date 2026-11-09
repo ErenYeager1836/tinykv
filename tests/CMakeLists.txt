@@ -30,3 +30,12 @@ if(TINYKV_LINK_FLAGS)
     target_link_options(test_server_resp PRIVATE ${TINYKV_LINK_FLAGS})
 endif()
 add_test(NAME test_server_resp COMMAND test_server_resp $<TARGET_FILE:tinykv>)
+
+# M4 Custom HashTable & Arena Allocator Unit Tests
+add_executable(test_hashtable test_hashtable.cpp ../src/hashtable.cpp)
+target_compile_options(test_hashtable PRIVATE ${TINYKV_COMMON_FLAGS})
+target_include_directories(test_hashtable PRIVATE ../src)
+if(TINYKV_LINK_FLAGS)
+    target_link_options(test_hashtable PRIVATE ${TINYKV_LINK_FLAGS})
+endif()
+add_test(NAME test_hashtable COMMAND test_hashtable)
