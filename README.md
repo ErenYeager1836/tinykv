@@ -2,7 +2,7 @@
 
 A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux.
 
-> **Project Status**: Milestone 2 complete (Single-threaded non-blocking epoll event loop, per-connection dynamic buffers, multi-client multiplexing, clean signal shutdown).
+> **Project Status**: Milestone 3 complete (Incremental RESP2 protocol parser & serializer, PING/ECHO/SET/GET/QUIT commands, compatibility stubs for redis-cli/redis-benchmark, fuzz tested).
 
 ---
 
@@ -65,12 +65,29 @@ ctest --test-dir build --output-on-failure
 ./build/tinykv --port 6379 --bind 127.0.0.1
 ```
 
-In another terminal:
+In another terminal, connect using standard tools or `redis-cli`:
 ```bash
-# Test with ncat or netcat
+# Using redis-cli (or valkey-cli)
+redis-cli -p 6379 PING
+# Output: PONG
+
+redis-cli -p 6379 SET user:1 Alice
+# Output: OK
+
+redis-cli -p 6379 GET user:1
+# Output: "Alice"
+
+# Or interact via raw netcat / telnet (inline protocol support)
 ncat 127.0.0.1 6379
 PING
-# tinykv echoes: PING
++PONG
+SET key value
++OK
+GET key
+$5
+value
+QUIT
++OK
 ```
 
 ---

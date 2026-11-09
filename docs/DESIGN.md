@@ -119,9 +119,77 @@ In Milestone 2, `tinykv` transitioned from sequential blocking I/O to a high-con
 
 ---
 
-## 4. Transition to Milestone 3: RESP2 Protocol Engine
+## 4. Milestone 3: RESP2 Protocol Engine & Command Dispatcher
 
-In Milestone 3, the raw byte echo logic is replaced with an incremental Redis Serialization Protocol (RESP2) parser and reply serialization engine:
-- Stateful stream parsing supporting chunked/fragmented packets and pipelined batches.
-- Initial commands: `PING`, `ECHO`, `SET`, `GET`.
-- Protocol fuzz testing to ensure zero memory corruption or unhandled crashes on adversarial payloads.
+In Milestone 3, the raw byte echo logic is replaced with a robust, incremental Redis Serialization Protocol (RESP2) parser, reply serializer, and command dispatcher.
+
+```
+                  Milestone 3 Request/Response Pipeline
+                  
+  [ Client Data ]  --> [ Connection read_buf ]
+                             |
+                      [ parse_resp() ]
+                             |
+             +---------------+---------------+
+             |                               |
+      [ RESP Array ]                  [ Inline Format ]
+     *<count>\r\n$<len>...            PING\r\n (telnet/cli)
+             |                               |
+             +---------------+---------------+
+                             |
+                  [ Command Arguments ]
+                 (std::vector<string_view>)
+                             |
+                  [ dispatch_command() ]
+                             |
+        +--------+--------+--------+--------+--------+
+        |        |        |        |        |        |
+      PING     ECHO      SET      GET     QUIT   COMPAT (COMMAND/CONFIG)
+        |        |        |        |        |        |
+        +--------+--------+--------+--------+--------+
+                             |
+                     [ Reply Writer ]
+             (+OK\r\n, $5\r\nhello\r\n, etc.)
+                             |
+                [ Connection write_buf ] --> [ Client Socket ]
+```
+
+### 4.1 Parser Architecture & Invariants
+
+1. **Incremental Stream Parsing (`parse_resp`)**:
+   - Because TCP arrives in arbitrary chunk sizes, the parser operates non-destructively on `std::string_view` slices of `conn.read_buf`.
+   - Returns three explicit states:
+     - `ParseResult::Done`: A complete command was parsed. `bytes_consumed` indicates the exact number of bytes to remove from `read_buf`.
+     - `ParseResult::NeedMoreData`: The buffer contains a partial RESP frame. The parser leaves `read_buf` intact and waits for subsequent `read()` events.
+     - `ParseResult::Error`: The client sent a malformed frame, negative length, integer overflow, or exceeded safety thresholds. Returns an error message for an immediate `-ERR` reply, followed by connection termination.
+
+2. **Inline and Array Protocol Support**:
+   - Standard Redis clients (`redis-cli`, `redis-benchmark`) emit RESP Arrays (`*<num-args>\r\n$<arg1-len>\r\n<arg1>...`).
+   - Debugging tools like `telnet` and `nc` emit plain whitespace-separated inline strings (`PING\r\n`, `GET mykey\r\n`).
+   - `tinykv` inspects the initial byte: `*` triggers standard RESP array parsing; any other non-whitespace character triggers the inline command parser.
+
+3. **Adversarial Input & DoS Protections**:
+   - **`kMaxArgs = 1024`**: Prevents unbounded dynamic array vector allocation.
+   - **`kMaxBulkLen = 1 MB`**: Immediately rejects bulk string headers requesting gigabytes of payload.
+   - **`kMaxInlineLen = 64 KB`**: Limits line length for inline commands, preventing endless scans for `\r\n`.
+   - **64-bit Integer Overflow Check**: Incremental parsing of integers checks against `INT64_MAX / 10` before multiplication, preventing undefined behavior on wrapped negative lengths.
+
+### 4.2 Reply Serialization
+Responses are constructed directly into the client's output buffer using compact RESP2 primitives:
+- Simple Strings: `+<str>\r\n` (e.g., `+PONG\r\n`, `+OK\r\n`)
+- Errors: `-<err_msg>\r\n` (e.g., `-ERR unknown command\r\n`)
+- Integers: `:<int>\r\n`
+- Bulk Strings: `$<length>\r\n<binary-safe-bytes>\r\n`
+- Null Bulk Strings: `$-1\r\n` (for cache misses on `GET`)
+- Empty Arrays: `*0\r\n` (for `COMMAND` and `CONFIG GET` stubs)
+
+### 4.3 Command Execution & Compatibility
+- **Case-Insensitive Dispatch**: Command names are normalized to uppercase for dispatch (`ping`, `Ping`, `PING`).
+- **Initial Core Commands**:
+  - `PING [message]`: Returns `+PONG\r\n` or the echoed message as bulk string.
+  - `ECHO <message>`: Echoes the argument as bulk string.
+  - `SET <key> <val>`: Stores key-value pair and returns `+OK\r\n`.
+  - `GET <key>`: Returns `$len\r\nval\r\n` or `$-1\r\n` if not found.
+  - `QUIT`: Returns `+OK\r\n` and flags the connection to close gracefully after the reply is flushed.
+- **Client Handshake Compatibility**: `redis-cli` and `redis-benchmark` transmit `COMMAND`, `COMMAND DOCS`, `CONFIG GET`, and `CLIENT` commands on connection startup. `tinykv` handles these safely by returning valid empty array/null responses rather than returning syntax errors, allowing real redis tooling to connect and execute immediately.
+
