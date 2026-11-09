@@ -352,5 +352,45 @@ Hardware: 11th Gen Intel Core i5-1135G7 @ 2.40GHz | Linux 7.2.11-arch1-1 | 50 cl
 - **Non-Pipelined (`P=1`)**: Valkey achieves ~76k–78k rps vs. tinykv's ~73k–75k rps (Valkey edges ahead by 2.5% to 5.2%). Valkey's extensive jemalloc integration and multi-page socket read buffers provide a slight edge under sequential ping-pong loads.
 - **Pipelined (`P=16`)**: tinykv crushes Valkey by **+75.5% to +110.7%**, achieving **1,020,408 req/sec** on `GET` and **970,873 req/sec** on `SET` (vs. Valkey's 581,395 rps and 460,829 rps). tinykv's single-threaded zero-lock architecture, contiguous slab allocator, and zero-copy RESP parsing shine under high-throughput batching.
 
+---
+
+## 8. Milestone 7: Binary Size Minimization & Cold Startup Analysis
+
+Milestone 7 measures binary footprint reduction and cold startup latency, demonstrating the core value proposition of a minimal, specialized key-value daemon.
+
+### 8.1 Size Optimization Toolchain
+The `MinSizeRel` build preset applies the following flags:
+- `-Os`: Optimize aggressively for smallest instruction cache footprint.
+- `-flto`: Whole-program link-time optimization (inlining across translation units and dead-code stripping).
+- `-fno-exceptions -fno-rtti`: Strips all exception handling tables (`.eh_frame`) and runtime type metadata.
+- `-ffunction-sections -fdata-sections`: Emits every function and global data in isolated ELF sections.
+- `-Wl,--gc-sections`: Unreferenced sections and dead functions are discarded at link time.
+- `strip` (`-s`): Discards all symbol tables and debug headers.
+
+### 8.2 Real Measured Binary Sizes
+
+| Profile / Configuration | Binary Size | Text Section | Data Section | BSS Section | Dependencies |
+|:---|:---:|:---:|:---:|:---:|:---|
+| **Valkey 9.1.2** (`valkey-server`) | **3,276 KB** (3.2 MB) | 2,933,314 B | 336,804 B | 220,184 B | glibc, libm, libssl, libcrypto, jemalloc, lua |
+| **tinykv (Default Release)** | **80 KB** | 63,114 B | 968 B | 24 B | glibc, libstdc++ |
+| **tinykv (Dynamic MinSizeRel)** | **35 KB** | 25,723 B | 1,008 B | 24 B | glibc, libstdc++ |
+| **tinykv (Dynamic libc-only)** | **168 KB** | 151,416 B | 5,144 B | 472 B | glibc only (static libstdc++) |
+| **tinykv (Fully Static Standalone)** | **871 KB** | 833,706 B | 27,768 B | 23,056 B | None (zero external dependencies) |
+
+> **Size Ratio**: At **35 KB**, dynamic `tinykv` is **91× smaller** than `valkey-server` on disk. The standalone static build (871 KB) is **3.7× smaller** than Valkey despite bundling the entire C runtime.
+
+### 8.3 Cold Startup Latency (Time to First PING Reply)
+
+Measured using `bench/startup_bench` (spawning cold processes over loopback and timing socket connection + first `+PONG` reply, median of 20 runs):
+
+| Server | Median Startup Latency | Min Latency | Max Latency | Speedup |
+|:---|:---:|:---:|:---:|:---:|
+| **Valkey 9.1.2** | 46.46 ms | 45.13 ms | 230.47 ms | 1.0× (baseline) |
+| **tinykv (Dynamic MinSizeRel)** | **3.34 ms** | 2.97 ms | 4.49 ms | **13.9× faster** |
+| **tinykv (Fully Static Standalone)**| **1.40 ms** | 1.24 ms | 1.52 ms | **33.2× faster** |
+
+*Note on musl on Arch Linux: Arch Linux's official repositories provide the C-only musl wrapper (`musl-gcc`); standard C++ library headers (`libstdc++-musl`) are not distributed in official Arch packages. Statically linking with glibc achieves a completely self-contained 871 KB binary with instant 1.4 ms cold startup.*
+
+
 
 

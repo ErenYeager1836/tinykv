@@ -2,7 +2,7 @@
 
 A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux.
 
-> **Project Status**: Milestone 6 complete (Reproducible benchmarks via bench/run.sh vs Valkey 9.1.2; evidence-based optimizations yielding +27% P=1 throughput jump and > 1.02M req/sec on P=16 pipelining).
+> **Project Status**: Milestone 7 complete (Size builds: 35 KB dynamic, 871 KB static standalone; 1.4 ms cold startup time—33× faster than Valkey; -Os, LTO, -fno-exceptions, -fno-rtti, GC sections, stripped).
 
 ---
 
@@ -54,6 +54,30 @@ Tested using `valkey-benchmark` on Linux `7.2.11-arch1-1` (11th Gen Intel Core i
 | **GET** | P=16 | 256 B | **934,579.44** | 529,100.56 | **0.671 ms** | 2.231 ms | **+76.6%** |
 
 *Note: For non-pipelined ping-pong requests (`P=1`), Valkey edges out tinykv by 2.5% to 5.2%. For pipelined requests (`P=16`), tinykv outperforms Valkey by 75% to 110% due to its zero-copy RESP parser and single-threaded slab allocation.*
+
+---
+
+## Binary Size & Startup Time
+
+### Binary Footprint (Disk & Memory)
+Measured on Arch Linux x86-64 using GCC 16.2.1 (`-Os`, `-flto`, `-ffunction-sections`, `-fdata-sections`, `-Wl,--gc-sections`, stripped):
+
+| Target | Binary Size | Text Section | Dependencies | Ratio vs. Valkey |
+|:---|:---:|:---:|:---|:---:|
+| **Valkey 9.1.2** (`valkey-server`) | **3,276 KB** (3.2 MB) | 2,933,314 B | glibc, libm, libssl, jemalloc, lua | 1.0× (baseline) |
+| **tinykv (Default Release)** | **80 KB** | 63,114 B | glibc, libstdc++ | **41× smaller** |
+| **tinykv (Dynamic MinSizeRel)** | **35 KB** | 25,723 B | glibc, libstdc++ | **91× smaller** |
+| **tinykv (Dynamic libc-only)** | **168 KB** | 151,416 B | glibc only (static libstdc++) | **19× smaller** |
+| **tinykv (Fully Static Standalone)** | **871 KB** | 833,706 B | None (zero external shared libs) | **3.7× smaller** |
+
+### Cold Startup Latency (Time to First PING Reply)
+Measured using `bench/startup_bench` (spawning cold processes over loopback and timing socket connection + first `+PONG` reply, median of 20 runs):
+
+| Server | Median Startup Latency | Min Latency | Max Latency | Speedup |
+|:---|:---:|:---:|:---:|:---:|
+| **Valkey 9.1.2** | 46.46 ms | 45.13 ms | 230.47 ms | 1.0× (baseline) |
+| **tinykv (Dynamic MinSizeRel)** | **3.34 ms** | 2.97 ms | 4.49 ms | **13.9× faster** |
+| **tinykv (Fully Static Standalone)** | **1.40 ms** | 1.24 ms | 1.52 ms | **33.2× faster** |
 
 ---
 
