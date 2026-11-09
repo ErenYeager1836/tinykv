@@ -51,6 +51,19 @@ public:
     [[nodiscard]] const Entry* get(std::string_view key) const;
     [[nodiscard]] Entry* get_mut(std::string_view key);
 
+    // Look up entry with lazy expiry eviction.
+    // If key has expired (expire_at_ms <= now_ms), it is deleted and nullptr is returned.
+    Entry* lookup(std::string_view key, uint64_t now_ms = 0);
+
+    // Update value of existing key while preserving expiration timestamp.
+    bool update_value(std::string_view key, std::string_view new_val);
+
+    // Set expiration timestamp in milliseconds on an existing unexpired key.
+    bool set_expire(std::string_view key, uint64_t expire_at_ms, uint64_t now_ms = 0);
+
+    // Active expiry step: scans up to max_sample occupied slots and evicts expired keys.
+    size_t active_expire_step(uint64_t now_ms, size_t max_sample = 20);
+
     // Delete entry by key.
     bool del(std::string_view key);
 
@@ -87,6 +100,7 @@ private:
     size_t mask_{0};
     size_t size_{0};
     size_t tombstones_{0};
+    size_t active_expire_cursor_{0};
     SlabAllocator allocator_;
 };
 

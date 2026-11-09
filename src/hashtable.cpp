@@ -103,12 +103,14 @@ HashTable::HashTable(HashTable&& other) noexcept
       mask_(other.mask_),
       size_(other.size_),
       tombstones_(other.tombstones_),
+      active_expire_cursor_(other.active_expire_cursor_),
       allocator_(std::move(other.allocator_)) {
     other.entries_ = nullptr;
     other.capacity_ = 0;
     other.mask_ = 0;
     other.size_ = 0;
     other.tombstones_ = 0;
+    other.active_expire_cursor_ = 0;
 }
 
 HashTable& HashTable::operator=(HashTable&& other) noexcept {
@@ -121,6 +123,7 @@ HashTable& HashTable::operator=(HashTable&& other) noexcept {
         mask_ = other.mask_;
         size_ = other.size_;
         tombstones_ = other.tombstones_;
+        active_expire_cursor_ = other.active_expire_cursor_;
         allocator_ = std::move(other.allocator_);
 
         other.entries_ = nullptr;
@@ -128,6 +131,7 @@ HashTable& HashTable::operator=(HashTable&& other) noexcept {
         other.mask_ = 0;
         other.size_ = 0;
         other.tombstones_ = 0;
+        other.active_expire_cursor_ = 0;
     }
     return *this;
 }
@@ -158,6 +162,7 @@ void HashTable::rehash(size_t new_cap) {
     capacity_ = new_cap;
     mask_ = new_mask;
     tombstones_ = 0;
+    active_expire_cursor_ = 0;
 }
 
 bool HashTable::set(std::string_view key, std::string_view val, uint64_t expire_at_ms) {
@@ -298,6 +303,90 @@ Entry* HashTable::get_mut(std::string_view key) {
         }
     }
     return nullptr;
+}
+
+Entry* HashTable::lookup(std::string_view key, uint64_t now_ms) {
+    if (key.empty() || size_ == 0) {
+        return nullptr;
+    }
+
+    Entry* e = get_mut(key);
+    if (e == nullptr) {
+        return nullptr;
+    }
+
+    if (now_ms != 0 && e->expire_at_ms != 0 && e->expire_at_ms <= now_ms) {
+        del(key);
+        return nullptr;
+    }
+
+    return e;
+}
+
+bool HashTable::update_value(std::string_view key, std::string_view new_val) {
+    Entry* e = get_mut(key);
+    if (e == nullptr) {
+        return false;
+    }
+    allocator_.deallocate(e->val, e->val_len + 1);
+    char* new_val_buf = static_cast<char*>(allocator_.allocate(new_val.size() + 1));
+    if (new_val_buf == nullptr) {
+        return false;
+    }
+    std::memcpy(new_val_buf, new_val.data(), new_val.size());
+    new_val_buf[new_val.size()] = '\0';
+    e->val = new_val_buf;
+    e->val_len = static_cast<uint32_t>(new_val.size());
+    return true;
+}
+
+bool HashTable::set_expire(std::string_view key, uint64_t expire_at_ms, uint64_t now_ms) {
+    Entry* e = lookup(key, now_ms);
+    if (e == nullptr) {
+        return false;
+    }
+    if (expire_at_ms <= now_ms && expire_at_ms != 0) {
+        del(key);
+        return true;
+    }
+    e->expire_at_ms = expire_at_ms;
+    return true;
+}
+
+size_t HashTable::active_expire_step(uint64_t now_ms, size_t max_sample) {
+    if (size_ == 0 || now_ms == 0) {
+        return 0;
+    }
+
+    size_t expired_count = 0;
+    size_t sampled = 0;
+    size_t scanned_slots = 0;
+
+    while (scanned_slots < capacity_ && sampled < max_sample && size_ > 0) {
+        size_t slot = active_expire_cursor_;
+        active_expire_cursor_ = (active_expire_cursor_ + 1) & mask_;
+        ++scanned_slots;
+
+        if (entries_[slot].state == SlotState::Occupied) {
+            ++sampled;
+            if (entries_[slot].expire_at_ms != 0 && entries_[slot].expire_at_ms <= now_ms) {
+                allocator_.deallocate(entries_[slot].key, entries_[slot].key_len + 1);
+                allocator_.deallocate(entries_[slot].val, entries_[slot].val_len + 1);
+                entries_[slot].key = nullptr;
+                entries_[slot].val = nullptr;
+                entries_[slot].key_len = 0;
+                entries_[slot].val_len = 0;
+                entries_[slot].hash = 0;
+                entries_[slot].expire_at_ms = 0;
+                entries_[slot].state = SlotState::Tombstone;
+                --size_;
+                ++tombstones_;
+                ++expired_count;
+            }
+        }
+    }
+
+    return expired_count;
 }
 
 bool HashTable::del(std::string_view key) {
