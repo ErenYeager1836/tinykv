@@ -1,4 +1,5 @@
 #include "server.h"
+#include "clock.h"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -156,8 +157,8 @@ int Server::run() {
     struct epoll_event events[kDefaultEpollEvents];
 
     while (running_) {
-        // Wait indefinitely until I/O events occur or a signal interrupts the wait
-        int nfds = ::epoll_wait(epoll_fd_, events, kDefaultEpollEvents, -1);
+        // Wait up to 100ms for I/O events, providing periodic active expiry checks (10 Hz)
+        int nfds = ::epoll_wait(epoll_fd_, events, kDefaultEpollEvents, 100);
         if (nfds < 0) {
             if (errno == EINTR) {
                 // Interrupted by signal (SIGINT, SIGTERM)
@@ -169,6 +170,10 @@ int Server::run() {
             std::fprintf(stderr, "[ERROR] epoll_wait error: %s (errno=%d)\n", std::strerror(errno), errno);
             break;
         }
+
+        // Active expiry tick (probabilistic eviction of expired keys)
+        uint64_t now_ms = get_monotonic_time_ms();
+        dispatcher_.active_expire_step(now_ms);
 
         for (int i = 0; i < nfds; ++i) {
             int fd = events[i].data.fd;
