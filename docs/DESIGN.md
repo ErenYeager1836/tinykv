@@ -248,3 +248,52 @@ In Milestone 4, `tinykv` completely eliminates the standard library's `std::unor
   - Allocations $> 4096$ bytes fall back to standard allocator.
   - Zero heap fragmentation and instant $O(1)$ recycling for typical Redis key and value workloads.
 
+---
+
+## 6. Milestone 5: Expiry Architecture & Extended Command Set
+
+Milestone 5 implements key lifetime management (TTL) and the remaining portfolio commands (`DEL`, `EXISTS`, `INCR`, `DECR`, `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`, `DBSIZE`), backed by both lazy and active expiration strategies.
+
+```
+                    Dual Expiry Architecture in tinykv
+                    
+      Client Request (e.g. GET / EXISTS)       10 Hz epoll Event Loop Tick
+                   |                                       |
+                   v                                       v
+        [ Lazy Expiry: lookup() ]              [ Active Expiry Step ]
+        - Check slot.expire_at_ms              - Scan ring buffer cursor
+        - If now_ms >= expire_at_ms:           - Sample up to 20 keys
+          * del() slot immediately             - Evict expired keys
+          * return nullptr (nil)               - If > 25% expired, loop again
+        - Else: return valid entry             - Bounded latency (< 1ms)
+```
+
+### 6.1 Fast Monotonic Time (`src/clock.h`)
+- Traditional `clock_gettime(CLOCK_MONOTONIC)` or `gettimeofday()` incurs a kernel switch on older setups.
+- `tinykv` utilizes `clock_gettime(CLOCK_MONOTONIC_COARSE, &ts)`:
+  - Resolved directly in userspace via the Linux kernel's **VDSO** page.
+  - Execution time is ~5–10 nanoseconds, providing 1 ms granularity ideal for cache expiration without degrading request throughput.
+
+### 6.2 Dual Expiration Engine
+1. **Lazy Deterministic Expiration**:
+   - Every lookup operation (`GET`, `EXISTS`, `INCR`, `DECR`, `TTL`) invokes `HashTable::lookup(key, now_ms)`.
+   - If `expire_at_ms != 0 && expire_at_ms <= now_ms`, the key is removed on the spot and returned as absent (`nil`).
+   - Guarantees zero stale data leaks to clients regardless of background scan frequency.
+
+2. **Active Probabilistic Expiration**:
+   - `Server::run()` configures `epoll_wait()` with a 100 ms timeout.
+   - On every timeout or I/O cycle (up to 10 Hz), `active_expire_step()` tests up to 20 occupied slots starting from a persistent ring-buffer cursor (`active_expire_cursor_`).
+   - If more than 25% of sampled keys were expired, it immediately repeats up to 10 iterations, reclaiming memory rapidly during mass expiration waves while strictly bounding execution time.
+
+### 6.3 Integer Operations & Overflow Protection
+- `INCR` and `DECR` parse existing strings as signed 64-bit integers (`int64_t`).
+- Strict overflow checking prevents undefined behavior:
+  - `(delta > 0 && current > INT64_MAX - delta)` -> `-ERR increment or decrement would overflow`
+  - `(delta < 0 && current < INT64_MIN - delta)` -> `-ERR increment or decrement would overflow`
+- Updates are written in place via `update_value()`, preserving any previously configured expiration timestamp.
+
+### 6.4 Pipelining Support
+- Because the RESP parser processes buffers incrementally from `read_buf` without relying on newline packet boundaries, clients can batch dozens or hundreds of requests in a single TCP write.
+- The server processes each command sequentially and aggregates responses into `write_buf`, flushing in a single socket write.
+
+

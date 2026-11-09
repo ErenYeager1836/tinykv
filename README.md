@@ -2,7 +2,7 @@
 
 A minimal, fast, Redis-compatible key-value server written in modern C++20 for Linux.
 
-> **Project Status**: Milestone 4 complete (Custom open-addressing hash table with linear probing, dual-mode tombstone purging/rehashing, slab/arena memory allocator, zero `std::unordered_map`).
+> **Project Status**: Milestone 5 complete (Full portfolio command set: PING, ECHO, SET (with EX/PX), GET, DEL, EXISTS, INCR, DECR, EXPIRE, PEXPIRE, TTL, PTTL, DBSIZE, QUIT; dual lazy and active expiration; pipelining verified).
 
 ---
 
