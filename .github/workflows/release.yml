@@ -1,0 +1,52 @@
+name: Release Assets
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build & Attach Release Binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Build Dynamic MinSizeRel binary (35 KB)
+        run: |
+          cmake -B build-minsize -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DENABLE_WERROR=ON
+          cmake --build build-minsize
+          cp build-minsize/tinykv tinykv-linux-x86_64-dynamic
+          chmod +x tinykv-linux-x86_64-dynamic
+
+      - name: Build Static Standalone binary (871 KB)
+        run: |
+          cmake -B build-static -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DENABLE_STATIC=ON -DENABLE_WERROR=ON
+          cmake --build build-static
+          cp build-static/tinykv tinykv-linux-x86_64-static
+          chmod +x tinykv-linux-x86_64-static
+
+      - name: Generate SHA-256 Checksums
+        run: |
+          sha256sum tinykv-linux-x86_64-dynamic tinykv-linux-x86_64-static > checksums.txt
+          cat checksums.txt
+
+      - name: Upload Binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            tinykv-linux-x86_64-dynamic
+            tinykv-linux-x86_64-static
+            checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
