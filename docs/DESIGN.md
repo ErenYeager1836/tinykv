@@ -296,4 +296,61 @@ Milestone 5 implements key lifetime management (TTL) and the remaining portfolio
 - Because the RESP parser processes buffers incrementally from `read_buf` without relying on newline packet boundaries, clients can batch dozens or hundreds of requests in a single TCP write.
 - The server processes each command sequentially and aggregates responses into `write_buf`, flushing in a single socket write.
 
+---
+
+## 7. Milestone 6: Performance Profiling, Optimizations & Valkey Comparison
+
+Milestone 6 establishes a reproducible benchmarking pipeline (`bench/run.sh`) against `Valkey server v=9.1.2` (the high-performance open-source Redis fork) and applies evidence-based kernel and algorithm optimizations.
+
+### 7.1 Profiling & Bottlenecks Identified
+
+1. **Nagle's Algorithm Buffering Latency (`TCP_NODELAY`)**:
+   - By default on Linux TCP sockets, Nagle's algorithm coalesces small packets. In ping-pong request/response workloads (`P=1`), combining Nagle's algorithm with delayed ACKs introduced artificial round-trip delays, capping single-pipeline 256B writes at ~58k rps.
+2. **Per-Command Dynamic Heap Allocation in Dispatch**:
+   - The initial dispatcher converted command names using `to_upper(cmd.args[0])`, causing a dynamic `std::string` heap allocation (`malloc` + `free`) on every single request.
+3. **Quadratic Memory Shifts during Pipelined Reads**:
+   - When a pipelined packet containing 16 commands arrived, the read loop called `conn.read_buf.erase(begin, begin + consumed)` after every command. This resulted in 16 successive `std::memmove` calls per read event, shifting shrinking buffers repeatedly.
+
+### 7.2 Evidence-Based Optimizations Implemented
+
+1. **Optimization 1: TCP_NODELAY Socket Tuning**:
+   - Configured `setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one))` immediately upon `accept4()`.
+   - Flushes packet replies immediately without awaiting kernel ACK coalescing.
+2. **Optimization 2: Zero-Allocation `iequals()` Dispatch**:
+   - Replaced string allocation with a zero-copy case-insensitive string_view comparator:
+     ```cpp
+     bool iequals(std::string_view a, std::string_view b) noexcept;
+     ```
+   - Reordered branch conditions so high-frequency commands (`GET` and `SET`) match on the first branch check, optimizing CPU branch predictor hit rates.
+3. **Optimization 3: Batch Cursor Slicing**:
+   - Replaced per-command vector erasures with an offset cursor:
+     ```cpp
+     size_t offset = 0;
+     while (offset < conn.read_buf.size()) {
+         parse_resp(conn.read_buf.data() + offset, ...);
+         offset += consumed;
+     }
+     if (offset >= conn.read_buf.size()) conn.read_buf.clear();
+     ```
+   - Eliminates 100% of internal buffer memory moves for fully consumed pipelined buffers.
+
+### 7.3 Before vs. After Optimization Measurements
+
+Hardware: 11th Gen Intel Core i5-1135G7 @ 2.40GHz | Linux 7.2.11-arch1-1 | 50 clients | 100,000 requests (median of 5 runs):
+
+| Workload | Metric | Before Optimization | After Optimization | Delta |
+|:---|:---:|:---:|:---:|:---:|
+| **SET (P=1, 256 B)** | Throughput | 58,651.0 rps | **74,515.6 rps** | **+27.0%** |
+| | p99 Latency | 1.271 ms | **0.719 ms** | **-43.4%** |
+| **SET (P=1, 16 B)** | Throughput | 63,211.1 rps | **74,850.3 rps** | **+18.4%** |
+| | p99 Latency | 1.071 ms | **0.711 ms** | **-33.6%** |
+| **GET (P=16, 16 B)** | Throughput | 990,099.0 rps | **1,020,408.2 rps** | **+3.1% (>1M rps)** |
+| | p99 Latency | 0.839 ms | **0.639 ms** | **-23.8%** |
+
+### 7.4 Honest Comparison vs. Valkey 9.1.2
+
+- **Non-Pipelined (`P=1`)**: Valkey achieves ~76k–78k rps vs. tinykv's ~73k–75k rps (Valkey edges ahead by 2.5% to 5.2%). Valkey's extensive jemalloc integration and multi-page socket read buffers provide a slight edge under sequential ping-pong loads.
+- **Pipelined (`P=16`)**: tinykv crushes Valkey by **+75.5% to +110.7%**, achieving **1,020,408 req/sec** on `GET` and **970,873 req/sec** on `SET` (vs. Valkey's 581,395 rps and 460,829 rps). tinykv's single-threaded zero-lock architecture, contiguous slab allocator, and zero-copy RESP parsing shine under high-throughput batching.
+
+
 
