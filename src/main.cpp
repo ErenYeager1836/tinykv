@@ -81,7 +81,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::printf("[INFO] tinykv M2 non-blocking epoll echo server ready.\n");
+    std::printf("[INFO] tinykv M3 RESP2 server ready.\n");
     int rc = server.run();
     g_server_ptr = nullptr;
 

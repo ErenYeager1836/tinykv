@@ -299,12 +299,33 @@ void Server::handle_read(int fd) {
         }
     }
 
-    // In M2: Echo mode (transfer read buffer directly to write buffer)
-    if (!conn.read_buf.empty()) {
-        conn.write_buf.insert(conn.write_buf.end(), conn.read_buf.begin(), conn.read_buf.end());
-        conn.read_buf.clear();
+    // Incremental RESP2 parsing loop: processes all complete commands in read_buf
+    while (!conn.read_buf.empty()) {
+        size_t consumed = 0;
+        Command cmd;
+        ParseStatus status = parse_resp(conn.read_buf.data(), conn.read_buf.size(), consumed, cmd);
 
-        // Attempt non-blocking write immediately
+        if (status == ParseStatus::kOk) {
+            conn.read_buf.erase(conn.read_buf.begin(),
+                                conn.read_buf.begin() + static_cast<std::ptrdiff_t>(consumed));
+            if (!cmd.args.empty()) {
+                ExecutionResult res = dispatcher_.dispatch(cmd, conn.write_buf);
+                if (res.close_connection) {
+                    conn.close_after_write = true;
+                }
+            }
+        } else if (status == ParseStatus::kIncomplete) {
+            // Need more data from the network
+            break;
+        } else {
+            // Protocol error or security violation
+            write_error(conn.write_buf, "ERR Protocol error: invalid stream or length");
+            conn.close_after_write = true;
+            break;
+        }
+    }
+
+    if (!conn.write_buf.empty()) {
         handle_write(fd);
     }
 }
@@ -343,6 +364,11 @@ void Server::handle_write(int fd) {
     // Full write buffer has been flushed to the socket
     conn.write_buf.clear();
     conn.write_offset = 0;
+
+    if (conn.close_after_write) {
+        close_connection(fd);
+        return;
+    }
 
     // CRITICAL for level-triggered epoll:
     // If EPOLLOUT is enabled, epoll_wait will trigger continuously (sockets are

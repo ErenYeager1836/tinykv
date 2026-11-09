@@ -41,6 +41,8 @@ endif()
 add_executable(tinykv
     src/main.cpp
     src/server.cpp
+    src/resp.cpp
+    src/commands.cpp
 )
 
 target_compile_options(tinykv PRIVATE ${TINYKV_COMMON_FLAGS})

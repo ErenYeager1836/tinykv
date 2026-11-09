@@ -1,5 +1,8 @@
 #pragma once
 
+#include "commands.h"
+#include "resp.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -26,6 +29,7 @@ struct Connection {
     std::vector<uint8_t> write_buf;
     size_t write_offset{0};
     uint32_t epoll_events{0};
+    bool close_after_write{false};
 
     explicit Connection(int sock_fd) : fd(sock_fd) {
         read_buf.reserve(4096);
@@ -74,6 +78,9 @@ private:
 
     // Fast O(1) connection table indexed directly by client file descriptor
     std::vector<std::unique_ptr<Connection>> conns_;
+
+    // Command dispatch engine
+    CommandDispatcher dispatcher_;
 
     // Socket and epoll helpers
     int set_nonblocking(int fd);
